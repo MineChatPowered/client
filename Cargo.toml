@@ -32,3 +32,4 @@ thiserror = "2.0.11"
 tokio = { version = "1.41.1", features = ["full"] }
 ansi_term = "0.12.1"
 minechat-protocol = "0.3.0"
+rustyline = "15.0.0"

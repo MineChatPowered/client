@@ -12,11 +12,13 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
     path::PathBuf,
+    thread,
 };
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, BufReader},
     net::TcpStream,
     signal,
+    sync::mpsc,
 };
 
 #[derive(Parser)]
@@ -24,20 +26,39 @@ use tokio::{
     name = "MineCLI",
     version = "0.1.1",
     author = "walker84837",
-    about = "CLI client for MineChat"
+    about = "CLI client for MineChat",
+    // Enforce that server is a non-empty string.
+    arg_required_else_help = true
 )]
 struct Args {
-    /// The MineChat server address (host:port)
-    #[clap(short, long, required = true)]
+    /// The MineChat server hostname (without port)
+    #[clap(short, long, value_parser = clap::builder::NonEmptyStringValueParser::new(), help = "The server hostname (e.g. example.com)")]
     server: String,
 
+    /// The MineChat server port (defaults to 25575)
+    #[clap(
+        short = 'p',
+        long,
+        default_value = "25575",
+        help = "The server port number"
+    )]
+    port: u16,
+
     /// Link account using the provided code
-    #[clap(long)]
+    #[clap(long, help = "Link account using the provided code")]
     link: Option<String>,
 
     /// Enable verbose logging
-    #[clap(short, long)]
+    #[clap(short, long, help = "Enable verbose logging")]
     verbose: bool,
+
+    /// Connection timeout in seconds
+    #[clap(
+        long,
+        default_value = "5",
+        help = "Timeout (in seconds) for establishing a connection"
+    )]
+    timeout: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -52,7 +73,7 @@ struct ServerEntry {
 }
 
 fn config_path() -> Result<PathBuf, MineChatError> {
-    let proj_dirs = ProjectDirs::from("", "", "minechat")
+    let proj_dirs = ProjectDirs::from("org", "winlogon", "minechat")
         .ok_or(MineChatError::ConfigError("Can't get config dir".into()))?;
     let config_dir = proj_dirs.config_dir();
     fs::create_dir_all(config_dir)?;
@@ -119,7 +140,7 @@ async fn handle_connect(server_addr: &str) -> Result<(), MineChatError> {
                 info!("Connected: {}", payload.message);
                 // Pass the split reader and writer to repl
                 let (reader, writer) = stream.into_split();
-                repl(BufReader::new(reader), writer).await
+                repl(BufReader::new(reader), writer, server_addr.to_string()).await
             } else {
                 Err(MineChatError::AuthFailed(payload.message))
             }
@@ -139,11 +160,12 @@ fn handle_incoming_message(
                 match msg {
                     MineChatMessage::Broadcast { payload } => {
                         let formatted_message = format!(
-                            "[{}] {}",
-                            Colour::Blue.paint(payload.from),
-                            Colour::Green.paint(payload.message)
+                            "(MineChat) {}: {}",
+                            Colour::Blue.paint(&payload.from),
+                            Colour::Green.paint(&payload.message)
                         );
-                        println!("{}", formatted_message);
+                        println!("\n{}", formatted_message);
+                        print!("{}", rustyline::DefaultPrompt::default().render_prompt()?);
                     }
                     MineChatMessage::Disconnect { payload } => {
                         println!(
@@ -162,13 +184,67 @@ fn handle_incoming_message(
     }
 }
 
-async fn repl<R, W>(mut reader: R, mut writer: W) -> Result<(), MineChatError>
+async fn repl<R, W>(mut reader: R, mut writer: W, server_name: String) -> Result<(), MineChatError>
 where
     R: AsyncBufRead + Unpin,
-    W: AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
-    let mut stdin = BufReader::new(tokio::io::stdin());
-    let mut buffer = String::new();
+    // Compute the history path in the config directory
+    let config = config_path()?;
+    let history_path = &config
+        .parent()
+        .ok_or(MineChatError::ConfigError("Invalid config path".into()))?
+        .join("history.txt");
+
+    let (tx, mut rx) = mpsc::channel::<String>(250);
+
+    let history_path_clone = history_path.clone();
+
+    thread::spawn(move || {
+        // Create the editor with default configuration
+        let mut rl = match rustyline::DefaultEditor::new() {
+            Ok(rl) => rl,
+            Err(e) => {
+                eprintln!("Failed to create editor: {}", e);
+                return;
+            }
+        };
+
+        // Load history from file
+        if let Err(e) = rl.load_history(&history_path_clone) {
+            eprintln!("Failed to load history: {}", e);
+        }
+        let prompt = format!(
+            "MineChat ({}) >> ",
+            Colour::Purple.paint(server_name.clone())
+        );
+
+        loop {
+            match rl.readline(&prompt) {
+                Ok(line) => {
+                    // Add non-empty lines to history and send to the channel.
+                    if !line.trim().is_empty() {
+                        if let Err(e) = rl.add_history_entry(line.as_str()) {
+                            eprintln!("Failed to add history entry: {}", e);
+                        }
+                    }
+                    if tx.blocking_send(line).is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Readline error: {}", err);
+                    break;
+                }
+            }
+        }
+
+        // Save history to file on exit
+        if let Err(e) = rl.save_history(&history_path_clone) {
+            eprintln!("Failed to save history: {}", e);
+        }
+    });
+
     let mut msg_buffer = String::new();
 
     loop {
@@ -176,25 +252,23 @@ where
             result = reader.read_line(&mut msg_buffer) => {
                 handle_incoming_message(result, &mut msg_buffer)?;
             }
-            result = stdin.read_line(&mut buffer) => {
-                let n = result?;
-                if n == 0 {
-                    send_message(&mut writer, &MineChatMessage::Disconnect {
-                        payload: DisconnectPayload { reason: "Client exit".into() }
-                    }).await?;
-                    return Ok(());
+            // Receive input from rustyline
+            maybe_line = rx.recv() => {
+                match maybe_line {
+                    Some(line) => {
+                        let input = line.trim().to_string();
+                        if input == "/exit" {
+                            send_message(&mut writer, &MineChatMessage::Disconnect {
+                                payload: DisconnectPayload { reason: "Client exit".into() }
+                            }).await?;
+                            return Ok(());
+                        }
+                        send_message(&mut writer, &MineChatMessage::Chat {
+                            payload: ChatPayload { message: input }
+                        }).await?;
+                    }
+                    None => break, // Channel closed
                 }
-                let input = buffer.trim().to_string();
-                if input == "/exit" {
-                    send_message(&mut writer, &MineChatMessage::Disconnect {
-                        payload: DisconnectPayload { reason: "Client exit".into() }
-                    }).await?;
-                    return Ok(());
-                }
-                send_message(&mut writer, &MineChatMessage::Chat {
-                    payload: ChatPayload { message: input }
-                }).await?;
-                buffer.clear();
             }
             _ = signal::ctrl_c() => {
                 send_message(&mut writer, &MineChatMessage::Disconnect {
@@ -204,6 +278,7 @@ where
             }
         }
     }
+    Ok(())
 }
 
 fn init_logger(verbose: bool) {
@@ -222,10 +297,12 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     init_logger(args.verbose);
 
+    let server_addr = format!("{}:{}", args.server, args.port);
+
     if let Some(code) = args.link {
-        set_link(&args.server, &code).await
+        set_link(&server_addr, &code).await
     } else {
-        handle_connect(&args.server).await
+        handle_connect(&server_addr).await
     }
     .map_err(miette::Report::new)?;
 
