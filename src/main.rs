@@ -312,19 +312,25 @@ impl MineCLI {
 
     async fn process_user_input(&mut self, input: String) -> Result<(), MineChatError> {
         let input = input.trim();
-        if LEAVE_CMDS.contains(&input) {
-            self.send_disconnect().await
-        } else {
-            send_message(
-                &mut self.writer,
-                &MineChatMessage::Chat {
-                    payload: ChatPayload {
-                        message: input.to_string(),
-                    },
-                },
-            )
-            .await
+
+        if input.is_empty() {
+            debug!("Received empty input message, skipping...");
+            return Ok(());
         }
+
+        if LEAVE_CMDS.contains(&input) {
+            return self.send_disconnect().await;
+        }
+
+        send_message(
+            &mut self.writer,
+            &MineChatMessage::Chat {
+                payload: ChatPayload {
+                    message: input.to_string(),
+                },
+            },
+        )
+        .await
     }
 
     async fn send_disconnect(&mut self) -> Result<(), MineChatError> {
