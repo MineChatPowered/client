@@ -8,10 +8,11 @@ use minechat_protocol::{
     packets::{self, send_message},
     protocol::{MineChatError, *},
 };
-use rustyline::{ExternalPrinter, history::DefaultHistory};
+use rustyline::{ExternalPrinter, error::ReadlineError, history::DefaultHistory};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
+    io::{Error as IoError, ErrorKind as IoErrorKind},
     path::PathBuf,
     sync::{Arc, RwLock},
     thread,
@@ -126,7 +127,8 @@ struct MineCLI {
 }
 
 impl MineCLI {
-    async fn connect(server_addr: &str) -> Result<Self, MineChatError> {
+    async fn connect(server_addr: impl AsRef<str>) -> Result<Self, MineChatError> {
+        let server_addr = server_addr.as_ref();
         let config = load_config()?;
         let entry = config
             .servers
@@ -169,15 +171,11 @@ impl MineCLI {
             .ok_or(MineChatError::ConfigError("Invalid config path".into()))?
             .join("history.txt");
 
-        let mut editor = rustyline::Editor::<(), DefaultHistory>::new().map_err(|e| {
-            MineChatError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            ))
-        })?;
+        let mut editor = rustyline::Editor::<(), DefaultHistory>::new()
+            .map_err(|e| MineChatError::Io(IoError::new(IoErrorKind::Other, e)))?;
         let printer = editor
             .create_external_printer()
-            .map_err(|e| MineChatError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            .map_err(|e| MineChatError::Io(IoError::new(IoErrorKind::Other, e)))?;
 
         Ok(Self {
             reader,
@@ -216,8 +214,8 @@ impl MineCLI {
             loop {
                 let line = match editor.readline(&prompt) {
                     Ok(line) => line,
-                    Err(rustyline::error::ReadlineError::Interrupted) => continue,
-                    Err(rustyline::error::ReadlineError::Eof) => break,
+                    Err(ReadlineError::Interrupted) => continue,
+                    Err(ReadlineError::Eof) => break,
                     Err(e) => {
                         eprintln!("Readline error: {}", e);
                         break;
