@@ -5,7 +5,7 @@ use env_logger::{Builder, Target};
 use log::{LevelFilter, debug, info};
 use miette::Result;
 use minechat_protocol::{
-    packets::{self, receive_message, send_message},
+    packets::{self, send_message},
     protocol::{MineChatError, *},
 };
 use rustyline::{ExternalPrinter, history::DefaultHistory};
@@ -13,14 +13,19 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
     path::PathBuf,
+    sync::{Arc, RwLock},
     thread,
 };
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, BufReader},
+    io::{AsyncBufReadExt, BufReader, ReadHalf, WriteHalf},
     net::TcpStream,
     signal,
     sync::mpsc,
 };
+
+const LEAVE_CMDS: &[&str] = &["/exit", "/quit", "/leave", "/disconnect"];
+
+type SharedEditor = Arc<RwLock<rustyline::Editor<(), DefaultHistory>>>;
 
 #[derive(Parser)]
 #[clap(
@@ -111,177 +116,228 @@ async fn set_link(server_addr: &str, code: &str) -> Result<(), MineChatError> {
     Ok(())
 }
 
-async fn handle_connect(server_addr: &str) -> Result<(), MineChatError> {
-    let config = load_config()?;
-    let entry = config
-        .servers
-        .iter()
-        .find(|e| e.address == server_addr)
-        .ok_or(MineChatError::ServerNotLinked)?;
+struct MineCLI {
+    reader: BufReader<ReadHalf<TcpStream>>,
+    writer: WriteHalf<TcpStream>,
+    server_name: String,
+    editor: SharedEditor,
+    printer: Box<dyn ExternalPrinter>,
+    history_path: PathBuf,
+}
 
-    let mut stream = TcpStream::connect(server_addr).await?;
-    let (reader, mut writer) = stream.split();
-    let mut reader = BufReader::new(reader);
+impl MineCLI {
+    async fn connect(server_addr: &str) -> Result<Self, MineChatError> {
+        let config = load_config()?;
+        let entry = config
+            .servers
+            .iter()
+            .find(|e| e.address == server_addr)
+            .ok_or(MineChatError::ServerNotLinked)?;
 
-    send_message(
-        &mut writer,
-        &MineChatMessage::Auth {
-            payload: AuthPayload {
-                client_uuid: entry.uuid.clone(),
-                link_code: String::new(),
+        let stream = TcpStream::connect(server_addr).await?;
+        let (reader, mut writer) = tokio::io::split(stream);
+        let mut reader = BufReader::new(reader);
+
+        send_message(
+            &mut writer,
+            &MineChatMessage::Auth {
+                payload: AuthPayload {
+                    client_uuid: entry.uuid.clone(),
+                    link_code: String::new(),
+                },
             },
-        },
-    )
-    .await?;
+        )
+        .await?;
 
-    match receive_message(&mut reader).await? {
-        MineChatMessage::AuthAck { payload } => {
-            if payload.status != "success" {
-                return Err(MineChatError::AuthFailed(payload.message));
-            }
+        let mut msg_buffer = String::new();
+        reader.read_line(&mut msg_buffer).await?;
+        let msg = serde_json::from_str::<MineChatMessage>(&msg_buffer)?;
 
-            info!("Connected: {}", payload.message);
-            let (reader, writer) = stream.into_split();
-            repl(BufReader::new(reader), writer, server_addr.to_string()).await
-        }
-        _ => Err(MineChatError::AuthFailed("Unexpected response".into())),
-    }
-}
-
-fn handle_incoming_message(
-    result: std::io::Result<usize>,
-    msg_buffer: &mut String,
-    // TODO: make type alias for Whatever<rustyline::Editor<(), DefaultHistory>> -> SharedEditor
-    rl: &mut rustyline::Editor<(), DefaultHistory>,
-) -> Result<(), MineChatError> {
-    let mut printer = rl.create_external_printer().unwrap();
-    match result {
-        Ok(0) => Ok(()),
-        Ok(_) => {
-            if let Ok(msg) = serde_json::from_str::<MineChatMessage>(msg_buffer) {
-                match msg {
-                    MineChatMessage::Broadcast { payload } => {
-                        let formatted_message = format!(
-                            "(MineChat) {}: {}",
-                            Colour::Blue.paint(&payload.from),
-                            Colour::Green.paint(&payload.message)
-                        );
-                        printer.print(formatted_message).unwrap();
-                    }
-                    MineChatMessage::Disconnect { payload } => {
-                        printer
-                            .print(
-                                Colour::Red
-                                    .paint(format!("Disconnected: {}", payload.reason))
-                                    .to_string(),
-                            )
-                            .unwrap();
-                        return Ok(());
-                    }
-                    _ => debug!("Received message: {:?}", msg),
+        match msg {
+            MineChatMessage::AuthAck { payload } => {
+                if payload.status != "success" {
+                    return Err(MineChatError::AuthFailed(payload.message));
                 }
+                info!("Connected: {}", payload.message);
             }
-            msg_buffer.clear();
-            Ok(())
+            _ => return Err(MineChatError::AuthFailed("Unexpected response".into())),
         }
-        Err(e) => Err(e.into()),
-    }
-}
 
-async fn repl<R, W>(mut reader: R, mut writer: W, server_name: String) -> Result<(), MineChatError>
-where
-    R: AsyncBufRead + Unpin,
-    W: AsyncWrite + Unpin + Send + 'static,
-{
-    let config = config_path()?;
-    let history_path = &config
-        .parent()
-        .ok_or(MineChatError::ConfigError("Invalid config path".into()))?
-        .join("history.txt");
+        let config_path = config_path()?;
+        let history_path = config_path
+            .parent()
+            .ok_or(MineChatError::ConfigError("Invalid config path".into()))?
+            .join("history.txt");
 
-    let (tx, mut rx) = mpsc::channel::<String>(250);
-
-    let history_path_clone = history_path.clone();
-
-    // TODO: use types to allow this to be shared across theads, consider RwLock
-    let mut rl = match rustyline::DefaultEditor::new() {
-        Ok(rl) => rl,
-        Err(e) => {
-            return Err(MineChatError::Io(std::io::Error::new(
+        let mut editor = rustyline::Editor::<(), DefaultHistory>::new().map_err(|e| {
+            MineChatError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 e.to_string(),
-            )));
-        }
-    };
+            ))
+        })?;
+        let printer = editor
+            .create_external_printer()
+            .map_err(|e| MineChatError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-    thread::spawn(move || {
-        if let Err(e) = rl.load_history(&history_path_clone) {
-            eprintln!("Failed to load history: {}", e);
-        }
-        let prompt = format!(
-            "MineChat ({}) >> ",
-            Colour::Purple.paint(server_name.clone())
-        );
+        Ok(Self {
+            reader,
+            writer,
+            server_name: server_addr.to_string(),
+            editor: Arc::new(RwLock::new(editor)),
+            printer: Box::new(printer),
+            history_path,
+        })
+    }
 
-        loop {
-            match rl.readline(&prompt) {
-                Ok(line) => {
-                    if !line.trim().is_empty() {
-                        if let Err(e) = rl.add_history_entry(line.as_str()) {
-                            eprintln!("Failed to add history entry: {}", e);
-                        }
-                    }
-                    if tx.blocking_send(line).is_err() {
+    async fn run(mut self) -> Result<(), MineChatError> {
+        let (tx, mut rx) = mpsc::channel::<String>(250);
+        let editor_clone = self.editor.clone();
+        let server_name = self.server_name.clone();
+        let history_path = self.history_path.clone();
+
+        thread::spawn(move || {
+            let mut editor = match editor_clone.write() {
+                Ok(guard) => guard,
+                Err(e) => {
+                    eprintln!("Failed to acquire editor lock: {}", e);
+                    return;
+                }
+            };
+
+            if let Err(e) = editor.load_history(&history_path) {
+                eprintln!("Failed to load history: {}", e);
+            }
+
+            let prompt = format!(
+                "MineChat ({}) >> ",
+                Colour::Purple.paint(server_name.clone())
+            );
+
+            loop {
+                let line = match editor.readline(&prompt) {
+                    Ok(line) => line,
+                    Err(rustyline::error::ReadlineError::Interrupted) => continue,
+                    Err(rustyline::error::ReadlineError::Eof) => break,
+                    Err(e) => {
+                        eprintln!("Readline error: {}", e);
                         break;
                     }
+                };
+
+                if !line.trim().is_empty() {
+                    if let Err(e) = editor.add_history_entry(line.as_str()) {
+                        eprintln!("Failed to add history entry: {}", e);
+                    }
                 }
-                Err(err) => {
-                    eprintln!("Readline error: {}", err);
+
+                if tx.blocking_send(line).is_err() {
                     break;
                 }
             }
-        }
 
-        if let Err(e) = rl.save_history(&history_path_clone) {
-            eprintln!("Failed to save history: {}", e);
-        }
-    });
-
-    let mut msg_buffer = String::new();
-
-    loop {
-        tokio::select! {
-            result = reader.read_line(&mut msg_buffer) => {
-                handle_incoming_message(result, &mut msg_buffer, &mut rl)?;
+            if let Err(e) = editor.save_history(&history_path) {
+                eprintln!("Failed to save history: {}", e);
             }
-            // TODO: split this to a different function
-            maybe_line = rx.recv() => {
-                match maybe_line {
-                    Some(line) => {
-                        let input = line.trim().to_string();
-                        // TODO: make an array of commands to leave
-                        if input == "/exit" {
-                            send_message(&mut writer, &MineChatMessage::Disconnect {
-                                payload: DisconnectPayload { reason: "Client exit".into() }
-                            }).await?;
-                            return Ok(());
-                        }
-                        send_message(&mut writer, &MineChatMessage::Chat {
-                            payload: ChatPayload { message: input }
-                        }).await?;
+        });
+
+        let mut msg_buffer = String::new();
+        loop {
+            tokio::select! {
+                result = self.reader.read_line(&mut msg_buffer) => {
+                    self.handle_incoming_message(result, &mut msg_buffer)?;
+                }
+                maybe_line = rx.recv() => {
+                    if let Some(line) = maybe_line {
+                        self.process_user_input(line).await?;
+                    } else {
+                        break;
                     }
-                    None => break, // Channel closed
+                }
+                _ = signal::ctrl_c() => {
+                    self.send_disconnect().await?;
+                    return Ok(());
                 }
             }
-            _ = signal::ctrl_c() => {
-                send_message(&mut writer, &MineChatMessage::Disconnect {
-                    payload: DisconnectPayload { reason: "Client exit".into() }
-                }).await?;
-                return Ok(());
+        }
+        Ok(())
+    }
+
+    fn handle_incoming_message(
+        &mut self,
+        result: std::io::Result<usize>,
+        msg_buffer: &mut String,
+    ) -> Result<(), MineChatError> {
+        match result {
+            Ok(0) => Ok(()),
+            Ok(_) => {
+                if let Ok(msg) = serde_json::from_str::<MineChatMessage>(msg_buffer) {
+                    match msg {
+                        MineChatMessage::Broadcast { payload } => {
+                            let formatted_message = format!(
+                                "(MineChat) {}: {}",
+                                Colour::Blue.paint(&payload.from),
+                                Colour::Green.paint(&payload.message)
+                            );
+                            self.printer.print(formatted_message).map_err(|e| {
+                                MineChatError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    e.to_string(),
+                                ))
+                            })?;
+                        }
+                        MineChatMessage::Disconnect { payload } => {
+                            self.printer
+                                .print(
+                                    Colour::Red
+                                        .paint(format!("Disconnected: {}", payload.reason))
+                                        .to_string(),
+                                )
+                                .map_err(|e| {
+                                    MineChatError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::Other,
+                                        e.to_string(),
+                                    ))
+                                })?;
+                            return Ok(());
+                        }
+                        _ => debug!("Received message: {:?}", msg),
+                    }
+                }
+                msg_buffer.clear();
+                Ok(())
             }
+            Err(e) => Err(e.into()),
         }
     }
-    Ok(())
+
+    async fn process_user_input(&mut self, input: String) -> Result<(), MineChatError> {
+        let input = input.trim();
+        if LEAVE_CMDS.contains(&input) {
+            self.send_disconnect().await
+        } else {
+            send_message(
+                &mut self.writer,
+                &MineChatMessage::Chat {
+                    payload: ChatPayload {
+                        message: input.to_string(),
+                    },
+                },
+            )
+            .await
+        }
+    }
+
+    async fn send_disconnect(&mut self) -> Result<(), MineChatError> {
+        send_message(
+            &mut self.writer,
+            &MineChatMessage::Disconnect {
+                payload: DisconnectPayload {
+                    reason: "Client exit".into(),
+                },
+            },
+        )
+        .await
+    }
 }
 
 fn init_logger(verbose: bool) {
@@ -305,7 +361,8 @@ async fn main() -> Result<()> {
     if let Some(code) = args.link {
         set_link(&server_addr, &code).await
     } else {
-        handle_connect(&server_addr).await
+        let cli = MineCLI::connect(&server_addr).await?;
+        cli.run().await
     }
     .map_err(miette::Report::new)?;
 
