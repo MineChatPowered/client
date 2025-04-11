@@ -271,16 +271,10 @@ impl MineCLI {
                 if let Ok(msg) = serde_json::from_str::<MineChatMessage>(msg_buffer) {
                     match msg {
                         MineChatMessage::Broadcast { payload } => {
-                            let formatted_message = format!(
-                                "(MineChat) {}: {}",
-                                Colour::Blue.paint(&payload.from),
-                                Colour::Green.paint(&payload.message)
-                            );
+                            let formatted_message =
+                                format!("(MineChat): {}", Colour::Green.paint(&payload.message));
                             self.printer.print(formatted_message).map_err(|e| {
-                                MineChatError::Io(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    e.to_string(),
-                                ))
+                                MineChatError::Io(IoError::new(IoErrorKind::Other, e.to_string()))
                             })?;
                         }
                         MineChatMessage::Disconnect { payload } => {
@@ -291,8 +285,8 @@ impl MineCLI {
                                         .to_string(),
                                 )
                                 .map_err(|e| {
-                                    MineChatError::Io(std::io::Error::new(
-                                        std::io::ErrorKind::Other,
+                                    MineChatError::Io(IoError::new(
+                                        IoErrorKind::Other,
                                         e.to_string(),
                                     ))
                                 })?;
