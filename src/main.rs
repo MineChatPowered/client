@@ -2,12 +2,13 @@ use ansi_term::Colour;
 use clap::Parser;
 use directories::ProjectDirs;
 use env_logger::{Builder, Target};
-use log::{debug, info};
+use log::{LevelFilter, debug, info};
 use miette::Result;
 use minechat_protocol::{
     packets::{self, receive_message, send_message},
     protocol::{MineChatError, *},
 };
+use rustyline::{ExternalPrinter, history::DefaultHistory};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
@@ -27,7 +28,6 @@ use tokio::{
     version = "0.1.1",
     author = "walker84837",
     about = "CLI client for MineChat",
-    // Enforce that server is a non-empty string.
     arg_required_else_help = true
 )]
 struct Args {
@@ -136,14 +136,13 @@ async fn handle_connect(server_addr: &str) -> Result<(), MineChatError> {
 
     match receive_message(&mut reader).await? {
         MineChatMessage::AuthAck { payload } => {
-            if payload.status == "success" {
-                info!("Connected: {}", payload.message);
-                // Pass the split reader and writer to repl
-                let (reader, writer) = stream.into_split();
-                repl(BufReader::new(reader), writer, server_addr.to_string()).await
-            } else {
-                Err(MineChatError::AuthFailed(payload.message))
+            if payload.status != "success" {
+                return Err(MineChatError::AuthFailed(payload.message));
             }
+
+            info!("Connected: {}", payload.message);
+            let (reader, writer) = stream.into_split();
+            repl(BufReader::new(reader), writer, server_addr.to_string()).await
         }
         _ => Err(MineChatError::AuthFailed("Unexpected response".into())),
     }
@@ -152,7 +151,10 @@ async fn handle_connect(server_addr: &str) -> Result<(), MineChatError> {
 fn handle_incoming_message(
     result: std::io::Result<usize>,
     msg_buffer: &mut String,
+    // TODO: make type alias for Whatever<rustyline::Editor<(), DefaultHistory>> -> SharedEditor
+    rl: &mut rustyline::Editor<(), DefaultHistory>,
 ) -> Result<(), MineChatError> {
+    let mut printer = rl.create_external_printer().unwrap();
     match result {
         Ok(0) => Ok(()),
         Ok(_) => {
@@ -164,14 +166,16 @@ fn handle_incoming_message(
                             Colour::Blue.paint(&payload.from),
                             Colour::Green.paint(&payload.message)
                         );
-                        println!("\n{}", formatted_message);
-                        print!("{}", rustyline::DefaultPrompt::default().render_prompt()?);
+                        printer.print(formatted_message).unwrap();
                     }
                     MineChatMessage::Disconnect { payload } => {
-                        println!(
-                            "{}",
-                            Colour::Red.paint(format!("Disconnected: {}", payload.reason))
-                        );
+                        printer
+                            .print(
+                                Colour::Red
+                                    .paint(format!("Disconnected: {}", payload.reason))
+                                    .to_string(),
+                            )
+                            .unwrap();
                         return Ok(());
                     }
                     _ => debug!("Received message: {:?}", msg),
@@ -189,7 +193,6 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    // Compute the history path in the config directory
     let config = config_path()?;
     let history_path = &config
         .parent()
@@ -200,17 +203,18 @@ where
 
     let history_path_clone = history_path.clone();
 
-    thread::spawn(move || {
-        // Create the editor with default configuration
-        let mut rl = match rustyline::DefaultEditor::new() {
-            Ok(rl) => rl,
-            Err(e) => {
-                eprintln!("Failed to create editor: {}", e);
-                return;
-            }
-        };
+    // TODO: use types to allow this to be shared across theads, consider RwLock
+    let mut rl = match rustyline::DefaultEditor::new() {
+        Ok(rl) => rl,
+        Err(e) => {
+            return Err(MineChatError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            )));
+        }
+    };
 
-        // Load history from file
+    thread::spawn(move || {
         if let Err(e) = rl.load_history(&history_path_clone) {
             eprintln!("Failed to load history: {}", e);
         }
@@ -222,7 +226,6 @@ where
         loop {
             match rl.readline(&prompt) {
                 Ok(line) => {
-                    // Add non-empty lines to history and send to the channel.
                     if !line.trim().is_empty() {
                         if let Err(e) = rl.add_history_entry(line.as_str()) {
                             eprintln!("Failed to add history entry: {}", e);
@@ -239,7 +242,6 @@ where
             }
         }
 
-        // Save history to file on exit
         if let Err(e) = rl.save_history(&history_path_clone) {
             eprintln!("Failed to save history: {}", e);
         }
@@ -250,13 +252,14 @@ where
     loop {
         tokio::select! {
             result = reader.read_line(&mut msg_buffer) => {
-                handle_incoming_message(result, &mut msg_buffer)?;
+                handle_incoming_message(result, &mut msg_buffer, &mut rl)?;
             }
-            // Receive input from rustyline
+            // TODO: split this to a different function
             maybe_line = rx.recv() => {
                 match maybe_line {
                     Some(line) => {
                         let input = line.trim().to_string();
+                        // TODO: make an array of commands to leave
                         if input == "/exit" {
                             send_message(&mut writer, &MineChatMessage::Disconnect {
                                 payload: DisconnectPayload { reason: "Client exit".into() }
@@ -285,9 +288,9 @@ fn init_logger(verbose: bool) {
     let mut builder = Builder::from_default_env();
     builder.target(Target::Stdout);
     builder.filter_level(if verbose {
-        log::LevelFilter::Debug
+        LevelFilter::Debug
     } else {
-        log::LevelFilter::Info
+        LevelFilter::Info
     });
     builder.init();
 }
