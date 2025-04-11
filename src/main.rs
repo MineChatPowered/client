@@ -1,4 +1,4 @@
-use ansi_term::Colour;
+use ansi_term::{Colour, Style};
 use clap::Parser;
 use directories::ProjectDirs;
 use env_logger::{Builder, Target};
@@ -207,7 +207,8 @@ impl MineCLI {
             }
 
             let prompt = format!(
-                "MineChat ({}) >> ",
+                "{} ({}) >> ",
+                Style::new().bold().paint("MineChat"),
                 Colour::Purple.paint(server_name.clone())
             );
 
@@ -271,8 +272,11 @@ impl MineCLI {
                 if let Ok(msg) = serde_json::from_str::<MineChatMessage>(msg_buffer) {
                     match msg {
                         MineChatMessage::Broadcast { payload } => {
-                            let formatted_message =
-                                format!("(MineChat): {}", Colour::Green.paint(&payload.message));
+                            let formatted_message = format!(
+                                "(MChat) {}: {}",
+                                Colour::Blue.paint(&payload.from),
+                                Colour::Green.paint(&payload.message)
+                            );
                             self.printer.print(formatted_message).map_err(|e| {
                                 MineChatError::Io(IoError::new(IoErrorKind::Other, e.to_string()))
                             })?;
