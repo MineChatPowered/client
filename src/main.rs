@@ -1,29 +1,32 @@
 use clap::Parser;
 use directories::ProjectDirs;
 use env_logger::{Builder, Target};
-use log::{debug, info};
-use miette::Result;
+use kyori_component_json::Component;
+use log::{debug, info, warn};
 use minechat_protocol::{
-    packets::{self, receive_message, send_message},
-    protocol::{MineChatError, *},
+    RustlsTlsMessageStream, link_with_server,
+    protocol::{chat_format::*, *},
+    send_capabilities, send_chat_message, send_disconnect, send_pong, wait_auth_ok,
 };
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
-    path::PathBuf,
+    marker::Send,
 };
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, BufReader},
-    net::TcpStream,
+    io::{AsyncBufReadExt, BufReader},
     signal,
 };
+
+// Global chat format state
+static mut CHAT_FORMAT: &str = COMMONMARK;
 
 #[derive(Parser)]
 #[clap(
     name = "MineCLI",
-    version = "0.1.1",
+    version = "0.2.0",
     author = "walker84837",
-    about = "CLI client for MineChat"
+    about = "CLI client for MineChat Protocol v1.0.0"
 )]
 struct Args {
     /// The MineChat server address (host:port)
@@ -37,30 +40,39 @@ struct Args {
     /// Enable verbose logging
     #[clap(short, long)]
     verbose: bool,
+
+    /// Use component format instead of CommonMark
+    #[clap(long)]
+    components: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ServerConfig {
     servers: Vec<ServerEntry>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct ServerEntry {
     address: String,
-    uuid: String,
+    client_uuid: String,
+    minecraft_uuid: String,
+    pinned_cert: Option<String>,
+    supports_components: bool,
 }
 
-fn config_path() -> Result<PathBuf, MineChatError> {
-    let proj_dirs = ProjectDirs::from("", "", "minechat")
-        .ok_or(MineChatError::ConfigError("Can't get config dir".into()))?;
+fn config_path() -> Result<String, Box<dyn std::error::Error>> {
+    let proj_dirs = ProjectDirs::from("", "", "minechat").ok_or("Can't get config dir")?;
     let config_dir = proj_dirs.config_dir();
     fs::create_dir_all(config_dir)?;
-    Ok(config_dir.join("servers.json"))
+    Ok(config_dir
+        .join("servers.json")
+        .to_string_lossy()
+        .to_string())
 }
 
-fn load_config() -> Result<ServerConfig, MineChatError> {
+fn load_config() -> Result<ServerConfig, Box<dyn std::error::Error>> {
     let path = config_path()?;
-    if !path.exists() {
+    if !std::path::Path::new(&path).exists() {
         return Ok(ServerConfig {
             servers: Vec::new(),
         });
@@ -69,124 +81,345 @@ fn load_config() -> Result<ServerConfig, MineChatError> {
     Ok(serde_json::from_reader(file)?)
 }
 
-fn save_config(config: &ServerConfig) -> Result<(), MineChatError> {
+fn save_config(config: &ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     let path = config_path()?;
     let file = File::create(path)?;
     Ok(serde_json::to_writer_pretty(file, config)?)
 }
 
-async fn set_link(server_addr: &str, code: &str) -> Result<(), MineChatError> {
-    let (client_uuid, _link_code) = packets::link_with_server(server_addr, code).await?;
+async fn set_link(server_addr: &str, code: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate link code
+    if code.trim().is_empty() {
+        return Err("Link code cannot be empty".into());
+    }
 
-    info!("Linked successfully");
+    info!("Connecting to {} for linking...", server_addr);
+
+    // Validate server address format
+    let (host, port_str) = server_addr
+        .rsplit_once(':')
+        .ok_or("Invalid server address format. Expected format: host:port")?;
+
+    // Validate port
+    port_str
+        .parse::<u16>()
+        .map_err(|_| "Invalid port number. Must be between 1-65535")?;
+
+    // Try to get existing pinned certificate
+    let config = load_config()?;
+    let pinned_cert = config
+        .servers
+        .iter()
+        .find(|e| e.address == server_addr)
+        .and_then(|e| e.pinned_cert.clone());
+
+    // Connect with TLS and certificate pinning
+    let mut message_stream = RustlsTlsMessageStream::connect_with_pinning(
+        host,
+        server_addr,
+        pinned_cert.as_deref()
+    ).await.map_err(|e| {
+        match e {
+            MineChatError::ConfigError(ref msg) if msg.contains("certificate") => {
+                format!("Certificate verification failed: {}. This may indicate a MITM attack or server certificate change.", msg)
+            }
+            _ => format!("TLS connection failed: {}", e)
+        }
+    })?;
+
+    info!("Sending LINK packet...");
+    // For new linking, pass None so a new UUID is generated
+    let (client_uuid, minecraft_uuid) = link_with_server(&mut message_stream, None, code).await?;
+
+    info!("Linked successfully!");
+    info!("Client UUID: {}", client_uuid);
+    info!("Minecraft UUID: {}", minecraft_uuid);
+
+    // Per spec: LINK -> LINK_OK -> CAPABILITIES -> AUTH_OK
+    info!("Sending capabilities...");
+    let supports_components = unsafe { CHAT_FORMAT == COMPONENTS };
+    send_capabilities(&mut message_stream, supports_components).await?;
+
+    // Wait for AUTH_OK
+    wait_auth_ok(&mut message_stream).await?;
+    info!("Authentication complete!");
+
+    // Extract and store server certificate for pinning
+    let pinned_cert = message_stream.server_certificate_base64();
+
     let mut config = load_config()?;
     config.servers.retain(|e| e.address != server_addr);
     config.servers.push(ServerEntry {
         address: server_addr.to_string(),
-        uuid: client_uuid,
+        client_uuid,
+        minecraft_uuid,
+        pinned_cert,
+        supports_components: false, // Will be updated after capabilities exchange
     });
     save_config(&config)?;
+
     Ok(())
 }
 
-async fn handle_connect(server_addr: &str) -> Result<(), MineChatError> {
+async fn handle_connect(server_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Connecting to {}...", server_addr);
+
     let config = load_config()?;
     let entry = config
         .servers
         .iter()
         .find(|e| e.address == server_addr)
-        .ok_or(MineChatError::ServerNotLinked)?;
+        .ok_or("Server not linked. Use --link to link first.")?;
 
-    let mut stream = TcpStream::connect(server_addr).await?;
-    let (reader, mut writer) = stream.split();
-    let mut reader = BufReader::new(reader);
+    // Parse server address to separate host and port
+    let (host, port_str) = server_addr
+        .rsplit_once(':')
+        .ok_or("Invalid server address format. Expected format: host:port")?;
 
-    send_message(
-        &mut writer,
-        &MineChatMessage::Auth {
-            payload: AuthPayload {
-                client_uuid: entry.uuid.clone(),
-                link_code: String::new(),
-            },
-        },
-    )
-    .await?;
+    // Validate port
+    port_str
+        .parse::<u16>()
+        .map_err(|_| "Invalid port number. Must be between 1-65535")?;
 
-    match receive_message(&mut reader).await? {
-        MineChatMessage::AuthAck { payload } => {
-            if payload.status == "success" {
-                info!("Connected: {}", payload.message);
-                // Pass the split reader and writer to repl
-                let (reader, writer) = stream.into_split();
-                repl(BufReader::new(reader), writer).await
-            } else {
-                Err(MineChatError::AuthFailed(payload.message))
+    // Connect with TLS and certificate pinning
+    let mut message_stream = RustlsTlsMessageStream::connect_with_pinning(host, server_addr, entry.pinned_cert.as_deref()
+    ).await.map_err(|e| {
+        match e {
+            MineChatError::ConfigError(ref msg) if msg.contains("certificate") => {
+                format!("Certificate verification failed: {}. This may indicate a MITM attack or server certificate change.", msg)
             }
+            _ => format!("TLS connection failed: {}", e)
         }
-        _ => Err(MineChatError::AuthFailed("Unexpected response".into())),
+    })?;
+
+    // Send reconnection packet with empty link code (per spec, empty = reconnection)
+    // Pass the stored client_uuid so server can identify us
+    info!("Authenticating with existing client UUID...");
+    let (_client_uuid, _minecraft_uuid) =
+        link_with_server(&mut message_stream, Some(entry.client_uuid.clone()), "").await?;
+
+    // Send capabilities
+    info!("Sending capabilities...");
+    let use_components = unsafe { CHAT_FORMAT == COMPONENTS };
+    send_capabilities(&mut message_stream, use_components).await?;
+
+    // Wait for AUTH_OK per spec (CAPABILITIES -> AUTH_OK)
+    wait_auth_ok(&mut message_stream).await?;
+
+    // Update server entry with capabilities support after successful capabilities exchange
+    let mut config = load_config()?;
+    if let Some(server_entry) = config.servers.iter_mut().find(|e| e.address == server_addr) {
+        server_entry.supports_components = use_components;
+        save_config(&config)?;
     }
+
+    info!(
+        "Connected successfully! Type /exit to quit, /format to switch between CommonMark and components."
+    );
+
+    repl(
+        &mut message_stream as &mut (dyn MessageStream + Unpin + Send),
+        use_components,
+    )
+    .await
 }
 
-async fn repl<R, W>(mut reader: R, mut writer: W) -> Result<(), MineChatError>
-where
-    R: AsyncBufRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
+async fn repl(
+    message_stream: &mut (dyn MessageStream + Unpin + Send),
+    server_supports_components: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut buffer = String::new();
-    let mut msg_buffer = String::new();
+    let mut use_components = unsafe { CHAT_FORMAT == COMPONENTS } && server_supports_components;
+    let mut muted = false;
 
     loop {
         tokio::select! {
-            result = reader.read_line(&mut msg_buffer) => {
+            result = message_stream.receive_packet() => {
                 match result {
-                    Ok(0) => return Ok(()),
-                    Ok(_) => {
-                        if let Ok(msg) = serde_json::from_str::<MineChatMessage>(&msg_buffer) {
-                            match msg {
-                                MineChatMessage::Broadcast { payload } => {
-                                    println!("[{}] {}", payload.from, payload.message);
-                                }
-                                MineChatMessage::Disconnect { payload } => {
-                                    println!("Disconnected: {}", payload.reason);
-                                    return Ok(());
-                                }
-                                _ => debug!("Received message: {:?}", msg),
-                            }
+                    Ok(packet) => {
+                        // Handle PING immediately here (required by spec)
+                        if let MineChatPacket {
+                            packet_type: packet_types::PING,
+                            payload: Payload::Ping(payload),
+                        } = &packet {
+                            debug!("Received PING: {}", payload.timestamp_ms);
+                            send_pong(message_stream, payload.timestamp_ms).await?;
+                            debug!("Sent PONG with timestamp: {}", payload.timestamp_ms);
                         }
-                        msg_buffer.clear();
+
+                        let should_disconnect = handle_server_packet(packet, &mut muted).await?;
+                        if should_disconnect {
+                            return Ok(());
+                        }
                     }
-                    Err(e) => return Err(e.into()),
+                    Err(MineChatError::Disconnected) => {
+                        info!("Server disconnected");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!("Error receiving packet: {}", e);
+                        return Err(e.into());
+                    }
                 }
             }
             result = stdin.read_line(&mut buffer) => {
                 let n = result?;
                 if n == 0 {
-                    send_message(&mut writer, &MineChatMessage::Disconnect {
-                        payload: DisconnectPayload { reason: "Client exit".into() }
-                    }).await?;
+                    send_disconnect(message_stream, "Client exit").await?;
                     return Ok(());
                 }
                 let input = buffer.trim().to_string();
-                if input == "/exit" {
-                    send_message(&mut writer, &MineChatMessage::Disconnect {
-                        payload: DisconnectPayload { reason: "Client exit".into() }
-                    }).await?;
-                    return Ok(());
+                if input.is_empty() {
+                    buffer.clear();
+                    continue;
                 }
-                send_message(&mut writer, &MineChatMessage::Chat {
-                    payload: ChatPayload { message: input }
-                }).await?;
+
+                if input == "/exit" {
+                    send_disconnect(message_stream, "Client exit").await?;
+                    return Ok(());
+                } else if input.starts_with('/') {
+                    if input == "/format" {
+                        use_components = !use_components;
+                        println!("Chat format switched to: {}",
+                            if use_components { "components" } else { "commonmark" });
+                    } else {
+                        warn!("Unknown command: {}. Available commands: /format, /exit", input);
+                    }
+                } else {
+                    // Per spec: enforce moderation - don't send if muted
+                    if muted {
+                        println!("You are currently muted and cannot send messages.");
+                    } else {
+                        let format = if use_components { COMPONENTS } else { COMMONMARK };
+                        let content = if use_components {
+                            // Create a simple text component
+                            let component = Component::text(&input);
+                            serde_json::to_string(&component)?
+                        } else {
+                            input.clone()
+                        };
+                        send_chat_message(message_stream, format, &content).await?;
+                    }
+                }
                 buffer.clear();
             }
             _ = signal::ctrl_c() => {
-                send_message(&mut writer, &MineChatMessage::Disconnect {
-                    payload: DisconnectPayload { reason: "Client exit".into() }
-                }).await?;
+                send_disconnect(message_stream, "Client exit").await?;
                 return Ok(());
             }
         }
     }
+}
+
+async fn handle_server_packet(
+    packet: MineChatPacket,
+    muted: &mut bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    match packet {
+        MineChatPacket {
+            packet_type: packet_types::CHAT_MESSAGE,
+            payload: Payload::ChatMessage(payload),
+        } => match payload.format.as_str() {
+            COMMONMARK => {
+                println!("[Chat] {}", payload.content);
+            }
+            COMPONENTS => {
+                // Parse and display component format
+                match serde_json::from_str::<Component>(&payload.content) {
+                    Ok(component) => {
+                        println!("[Chat] {}", component.to_plain_text());
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to parse component: {}, falling back to raw content",
+                            e
+                        );
+                        println!("[Chat] {}", payload.content);
+                    }
+                }
+            }
+            _ => {
+                println!("[Chat] {} (format: {})", payload.content, payload.format);
+            }
+        },
+        MineChatPacket {
+            packet_type: packet_types::PING,
+            payload: Payload::Ping(payload),
+        } => {
+            debug!("Received PING: {}", payload.timestamp_ms);
+            // Note: PONG is handled in the main loop now
+        }
+        MineChatPacket {
+            packet_type: packet_types::MODERATION,
+            payload: Payload::Moderation(payload),
+        } => {
+            let action_str = match payload.action {
+                moderation_action::WARN => "warn",
+                moderation_action::MUTE => "mute",
+                moderation_action::KICK => "kick",
+                moderation_action::BAN => "ban",
+                _ => "unknown",
+            };
+            let scope_str = match payload.scope {
+                moderation_scope::CLIENT => "client",
+                moderation_scope::ACCOUNT => "account",
+                _ => "unknown",
+            };
+
+            // Per spec: Clients MUST enforce moderation actions locally
+            match payload.action {
+                moderation_action::WARN => {
+                    warn!(
+                        "Moderation warning: {} {}, reason: {:?}",
+                        action_str, scope_str, payload.reason
+                    );
+                    println!(
+                        "[Warning] {}",
+                        payload.reason.as_deref().unwrap_or("You have been warned.")
+                    );
+                }
+                moderation_action::MUTE => {
+                    *muted = true;
+                    println!("[Muted] You have been muted. Reason: {:?}", payload.reason);
+                    if let Some(duration) = payload.duration_seconds {
+                        println!("Duration: {} seconds", duration);
+                    }
+                }
+                moderation_action::KICK => {
+                    println!(
+                        "[Kicked] You have been kicked. Reason: {:?}",
+                        payload.reason
+                    );
+                    return Ok(true); // Signal to disconnect
+                }
+                moderation_action::BAN => {
+                    println!(
+                        "[Banned] You have been banned. Reason: {:?}",
+                        payload.reason
+                    );
+                    return Ok(true); // Signal to disconnect
+                }
+                _ => {
+                    warn!(
+                        "Unknown moderation action: {} {}, reason: {:?}",
+                        action_str, scope_str, payload.reason
+                    );
+                }
+            }
+        }
+        MineChatPacket {
+            packet_type: packet_types::DISCONNECT,
+            payload: Payload::Disconnect(payload),
+        } => {
+            info!("Disconnected: {}", payload.reason);
+            return Ok(true);
+        }
+        _ => {
+            debug!("Received packet: {:?}", packet);
+        }
+    }
+    Ok(false)
 }
 
 fn init_logger(verbose: bool) {
@@ -201,16 +434,22 @@ fn init_logger(verbose: bool) {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     init_logger(args.verbose);
+
+    // Set global chat format based on CLI flag
+    unsafe {
+        CHAT_FORMAT = if args.components {
+            COMPONENTS
+        } else {
+            COMMONMARK
+        };
+    }
 
     if let Some(code) = args.link {
         set_link(&args.server, &code).await
     } else {
         handle_connect(&args.server).await
     }
-    .map_err(miette::Report::new)?;
-
-    Ok(())
 }
