@@ -2,7 +2,7 @@ use kyori_component_json::Component;
 use log::{debug, info, warn};
 use minechat_protocol::{
     packets::MineChatPacket,
-    protocol::{MessageStream, MineChatError, chat_format::COMMONMARK, chat_format::COMPONENTS},
+    protocol::{chat_format::COMMONMARK, chat_format::COMPONENTS, MessageStream, MineChatError},
     send_chat_message, send_disconnect, send_pong,
     types::MessageContent,
 };
@@ -11,178 +11,235 @@ use tokio::signal;
 
 static CHAT_FORMAT: &str = COMMONMARK;
 
+struct ReplState {
+    /// Whether the client will send outgoing messages as Minecraft text
+    /// components. Only true when both the preferred format and the server
+    /// capability agree.
+    use_components: bool,
+    /// Cached from the AUTH handshake so that `/format` can enforce it.
+    server_supports_components: bool,
+    /// Set to true when the server sends a MODERATION mute action.
+    muted: bool,
+}
+
+impl ReplState {
+    fn new(server_supports_components: bool) -> Self {
+        Self {
+            use_components: CHAT_FORMAT == COMPONENTS && server_supports_components,
+            server_supports_components,
+            muted: false,
+        }
+    }
+
+    fn current_format(&self) -> &'static str {
+        if self.use_components {
+            COMPONENTS
+        } else {
+            COMMONMARK
+        }
+    }
+
+    /// Toggle the outgoing chat format, respecting server capability.
+    fn toggle_format(&mut self) {
+        if !self.use_components && !self.server_supports_components {
+            println!("Server does not support the 'components' format; staying on 'commonmark'.");
+            return;
+        }
+        self.use_components = !self.use_components;
+        println!(
+            "Chat format switched to: {}",
+            if self.use_components {
+                "components"
+            } else {
+                "commonmark"
+            }
+        );
+    }
+}
+
 pub async fn repl(
-    message_stream: &mut (dyn MessageStream + Unpin + Send),
+    stream: &mut (dyn MessageStream + Unpin + Send),
     server_supports_components: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut buffer = String::new();
-    let mut use_components = CHAT_FORMAT == COMPONENTS && server_supports_components;
-    let mut muted = false;
+    let mut state = ReplState::new(server_supports_components);
 
     loop {
         tokio::select! {
-            result = message_stream.receive_packet() => {
+            result = stream.receive_packet() => {
                 match result {
                     Ok(packet) => {
-                        if let MineChatPacket::Ping { timestamp_ms } = &packet {
-                            debug!("Received PING: {}", timestamp_ms);
-                            send_pong(message_stream, *timestamp_ms).await?;
-                            debug!("Sent PONG with timestamp: {}", timestamp_ms);
-                        }
-
-                        let should_disconnect = handle_server_packet(packet, &mut muted).await?;
-                        if should_disconnect {
+                        if handle_server_packet(packet, stream, &mut state).await? {
                             return Ok(());
                         }
                     }
                     Err(MineChatError::Disconnected) => {
-                        info!("Server disconnected");
+                        info!("Server disconnected.");
                         return Ok(());
                     }
                     Err(e) => {
-                        warn!("Error receiving packet: {}", e);
+                        warn!("Error receiving packet: {e}");
                         return Err(e.into());
                     }
                 }
             }
+
             result = stdin.read_line(&mut buffer) => {
                 let n = result?;
+
+                // EOF - signal a clean exit
                 if n == 0 {
-                    send_disconnect(message_stream, "Client exit").await?;
+                    send_disconnect(stream, "Client exit").await?;
                     return Ok(());
                 }
+
+                // Trim and clear immediately so we never forget to reset the buffer
                 let input = buffer.trim().to_string();
+                buffer.clear();
+
                 if input.is_empty() {
-                    buffer.clear();
                     continue;
                 }
 
-                if input == "/exit" {
-                    send_disconnect(message_stream, "Client exit").await?;
+                if handle_input(stream, &input, &mut state).await? {
                     return Ok(());
-                } else if input.starts_with('/') {
-                    if input == "/format" {
-                        use_components = !use_components;
-                        println!(
-                            "Chat format switched to: {}",
-                            if use_components { "components" } else { "commonmark" }
-                        );
-                    } else {
-                        warn!(
-                            "Unknown command: {}. Available commands: /format, /exit",
-                            input
-                        );
-                    }
-                } else {
-                    if muted {
-                        println!("You are currently muted and cannot send messages.");
-                    } else {
-                        let format = if use_components {
-                            COMPONENTS
-                        } else {
-                            COMMONMARK
-                        };
-                        let content = if use_components {
-                            let component = Component::text(&input);
-                            serde_json::to_string(&component)?
-                        } else {
-                            input.clone()
-                        };
-                        send_chat_message(message_stream, format, &content).await?;
-                    }
                 }
-                buffer.clear();
             }
+
             _ = signal::ctrl_c() => {
-                send_disconnect(message_stream, "Client exit").await?;
+                send_disconnect(stream, "Client exit").await?;
                 return Ok(());
             }
         }
     }
 }
 
+/// Process one line of user input.
+///
+/// Returns `true` if the REPL should exit after this call.
+async fn handle_input(
+    stream: &mut (dyn MessageStream + Unpin + Send),
+    input: &str,
+    state: &mut ReplState,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if let Some(cmd) = input.strip_prefix('/') {
+        match cmd {
+            "exit" => {
+                send_disconnect(stream, "Client exit").await?;
+                return Ok(true);
+            }
+            "format" => state.toggle_format(),
+            _ => warn!("Unknown command: /{cmd}. Available commands: /format, /exit"),
+        }
+        return Ok(false);
+    }
+
+    // Plain chat message.
+    if state.muted {
+        println!("You are currently muted and cannot send messages.");
+        return Ok(false);
+    }
+
+    let format = state.current_format();
+    let content = if state.use_components {
+        serde_json::to_string(&Component::text(input))?
+    } else {
+        input.to_owned()
+    };
+    send_chat_message(stream, format, &content).await?;
+
+    Ok(false)
+}
+
+/// Dispatch an inbound packet from the server.
+///
+/// Returns `true` if the REPL should disconnect and exit.
 async fn handle_server_packet(
     packet: MineChatPacket,
-    muted: &mut bool,
+    stream: &mut (dyn MessageStream + Unpin + Send),
+    state: &mut ReplState,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     match packet {
-        MineChatPacket::ChatMessage { format, content } => match format.as_str() {
-            COMMONMARK => {
-                if let MessageContent::CommonMark(text) = content {
-                    println!("[Chat] {}", text);
-                } else {
-                    println!("[Chat] {}", content.to_plain_text());
-                }
-            }
-            COMPONENTS => {
-                if let MessageContent::Components(component) = content {
-                    println!("[Chat] {}", component.to_plain_text());
-                } else {
-                    println!("[Chat] {}", content.to_plain_text());
-                }
-            }
-            _ => {
-                println!(
-                    "[Chat] {} (format: {})",
-                    content.to_plain_text(),
-                    format.as_str()
-                );
-            }
-        },
+        // Keep-alive - respond immediately
         MineChatPacket::Ping { timestamp_ms } => {
-            debug!("Received PING: {}", timestamp_ms);
+            debug!("Received PING ({timestamp_ms}), sending PONG.");
+            send_pong(stream, timestamp_ms).await?;
         }
+
+        MineChatPacket::ChatMessage { format, content } => {
+            let text = match format.as_str() {
+                COMMONMARK => match content {
+                    MessageContent::CommonMark(ref t) => t.clone(),
+                    _ => content.to_plain_text(),
+                },
+                COMPONENTS => match content {
+                    MessageContent::Components(ref c) => c.to_plain_text(),
+                    _ => content.to_plain_text(),
+                },
+                other => {
+                    warn!("Unrecognised chat format '{other}', falling back to plain text.");
+                    content.to_plain_text()
+                }
+            };
+            println!("[Chat] {text}");
+        }
+
         MineChatPacket::Moderation {
             action,
             scope,
             reason,
             duration_seconds,
         } => {
-            let action_val = action.value();
-            let scope_val = scope.value();
+            let reason_str = reason.as_deref().unwrap_or("(no reason given)");
 
-            match action_val {
+            match action.value() {
+                // warn
                 0 => {
                     warn!(
-                        "Moderation warning: action={}, scope={}, reason: {:?}",
-                        action_val, scope_val, reason
+                        "Moderation: warn | scope={} | reason={reason_str}",
+                        scope.value()
                     );
-                    println!(
-                        "[Warning] {}",
-                        reason.as_deref().unwrap_or("You have been warned.")
-                    );
+                    println!("[Warning] {reason_str}");
                 }
+                // mute
                 1 => {
-                    *muted = true;
-                    println!("[Muted] You have been muted. Reason: {:?}", reason);
-                    if let Some(duration) = duration_seconds {
-                        println!("Duration: {} seconds", duration);
+                    state.muted = true;
+                    println!("[Muted] {reason_str}");
+                    if let Some(secs) = duration_seconds {
+                        println!("  Duration: {secs} seconds");
                     }
                 }
+                // kick
                 2 => {
-                    println!("[Kicked] You have been kicked. Reason: {:?}", reason);
+                    println!("[Kicked] {reason_str}");
                     return Ok(true);
                 }
+                // ban
                 3 => {
-                    println!("[Banned] You have been banned. Reason: {:?}", reason);
+                    println!("[Banned] {reason_str}");
                     return Ok(true);
                 }
-                _ => {
+                other => {
                     warn!(
-                        "Unknown moderation action: action={}, scope={}, reason: {:?}",
-                        action_val, scope_val, reason
+                        "Unknown moderation action {other} | scope={} | reason={reason_str}",
+                        scope.value()
                     );
                 }
             }
         }
+
+        // Server-initiated disconnect
         MineChatPacket::Disconnect { reason } => {
-            info!("Disconnected: {}", reason);
+            info!("Disconnected by server: {reason}");
             return Ok(true);
         }
-        _ => {
-            debug!("Received packet: {:?}", packet);
+
+        // Anything else - log at debug level and move on
+        other => {
+            debug!("Ignored unhandled packet: {other:?}");
         }
     }
+
     Ok(false)
 }
