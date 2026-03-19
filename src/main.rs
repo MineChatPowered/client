@@ -8,6 +8,8 @@ mod config;
 mod connect;
 mod repl;
 
+const DEFAULT_PORT: u16 = 7632;
+
 #[derive(Parser)]
 #[clap(
     name = "MineCLI",
@@ -16,9 +18,13 @@ mod repl;
     about = "CLI client for MineChat Protocol v1.0.0"
 )]
 struct Args {
-    /// The MineChat server address (host:port)
-    #[clap(short, long, required = true)]
-    server: String,
+    /// The MineChat server host
+    #[clap(required = true)]
+    host: String,
+
+    /// The MineChat server port (default: 7632)
+    #[clap(short, long, default_value_t = DEFAULT_PORT)]
+    port: u16,
 
     /// Link account using the provided code
     #[clap(long)]
@@ -47,8 +53,15 @@ fn init_logger(verbose: bool) {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    let server_addr = format!("{}:{}", args.host, args.port);
+
     init_logger(args.verbose);
 
+    info!(
+        "Connecting to {} (port {})",
+        args.host, args.port
+    );
     info!(
         "Chat format: {}",
         if args.components {
@@ -59,8 +72,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     if let Some(code) = args.link {
-        set_link(&args.server, &code, args.components).await
+        set_link(&server_addr, &code, args.components).await
     } else {
-        handle_connect(&args.server, args.components).await
+        handle_connect(&server_addr, args.components).await
     }
 }
