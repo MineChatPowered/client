@@ -3,7 +3,7 @@ use log::{debug, info, warn};
 use minechat_protocol::{
     packets::MineChatPacket,
     protocol::{MessageStream, MineChatError, chat_format::COMMONMARK, chat_format::COMPONENTS},
-    send_chat_message, send_disconnect, send_pong,
+    send_chat_message, send_pong,
     types::MessageContent,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -88,9 +88,9 @@ pub async fn repl(
             result = stdin.read_line(&mut buffer) => {
                 let n = result?;
 
-                // EOF - signal a clean exit
+                // EOF - exit cleanly (socket closed = disconnection)
                 if n == 0 {
-                    send_disconnect(stream, "Client exit").await?;
+                    info!("Exiting.");
                     return Ok(());
                 }
 
@@ -108,7 +108,7 @@ pub async fn repl(
             }
 
             _ = signal::ctrl_c() => {
-                send_disconnect(stream, "Client exit").await?;
+                info!("Received Ctrl+C, exiting.");
                 return Ok(());
             }
         }
@@ -125,12 +125,15 @@ async fn handle_input(
 ) -> Result<bool, Box<dyn std::error::Error>> {
     if let Some(cmd) = input.strip_prefix('/') {
         match cmd {
-            "exit" => {
-                send_disconnect(stream, "Client exit").await?;
+            "exit" | "quit" => {
+                info!("Exiting.");
                 return Ok(true);
             }
             "format" => state.toggle_format(),
-            _ => warn!("Unknown command: /{cmd}. Available commands: /format, /exit"),
+            "help" => {
+                println!("Available commands: /exit, /quit, /format, /help");
+            }
+            _ => warn!("Unknown command: /{cmd}. Available commands: /exit, /quit, /format, /help"),
         }
         return Ok(false);
     }
@@ -229,9 +232,17 @@ async fn handle_server_packet(
             }
         }
 
-        // Server-initiated disconnect
-        MineChatPacket::Disconnect { reason } => {
-            info!("Disconnected by server: {reason}");
+        // Server-initiated disconnect (system event)
+        MineChatPacket::SystemDisconnect { reason_code, message } => {
+            let reason_name = match reason_code {
+                0 => "Shutdown",
+                1 => "Maintenance",
+                2 => "Internal error",
+                3 => "Overloaded",
+                _ => "Unknown",
+            };
+            println!("[Server] Disconnected: {reason_name} - {message}");
+            info!("Disconnected by server: {reason_name}");
             return Ok(true);
         }
 
