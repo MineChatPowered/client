@@ -581,6 +581,8 @@ dependencies = [
 [[package]]
 name = "kyori-component-json"
 version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4e221e492f9b93cbc445d583d6c1baa5edb90a45b96b9f416ca2eeaed5210b8"
 dependencies = [
  "serde",
  "serde_json",
@@ -589,8 +591,7 @@ dependencies = [
 [[package]]
 name = "kyori-component-json"
 version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4e221e492f9b93cbc445d583d6c1baa5edb90a45b96b9f416ca2eeaed5210b8"
+source = "git+https://github.com/walker84837/kyori-component-json#0421e63b6cd9d06d403b03f8cc978d64d7a944d9"
 dependencies = [
  "serde",
  "serde_json",
@@ -687,7 +688,7 @@ dependencies = [
  "clap",
  "directories",
  "env_logger",
- "kyori-component-json 0.2.1",
+ "kyori-component-json 0.2.1 (git+https://github.com/walker84837/kyori-component-json)",
  "log",
  "miette",
  "minechat-protocol",

@@ -1,9 +1,9 @@
-use crate::config::{load_config, save_config, ServerEntry};
+use crate::config::{ServerEntry, load_config, save_config};
 use crate::repl::repl;
 use log::info;
 use minechat_protocol::{
-    link_with_server, protocol::MineChatError, send_capabilities, wait_auth_ok, MessageStream,
-    RustlsTlsMessageStream,
+    MessageStream, RustlsTlsMessageStream, link_with_server, protocol::MineChatError,
+    send_capabilities, wait_auth_ok,
 };
 
 pub async fn set_link(

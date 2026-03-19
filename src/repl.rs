@@ -2,7 +2,7 @@ use kyori_component_json::Component;
 use log::{debug, info, warn};
 use minechat_protocol::{
     packets::MineChatPacket,
-    protocol::{chat_format::COMMONMARK, chat_format::COMPONENTS, MessageStream, MineChatError},
+    protocol::{MessageStream, MineChatError, chat_format::COMMONMARK, chat_format::COMPONENTS},
     send_chat_message, send_disconnect, send_pong,
     types::MessageContent,
 };
@@ -171,15 +171,15 @@ async fn handle_server_packet(
             let text = match format.as_str() {
                 COMMONMARK => match content {
                     MessageContent::CommonMark(ref t) => t.clone(),
-                    _ => content.to_plain_text(),
+                    _ => content.to_plain_text().to_string(),
                 },
                 COMPONENTS => match content {
-                    MessageContent::Components(ref c) => c.to_plain_text(),
-                    _ => content.to_plain_text(),
+                    MessageContent::Components(ref c) => c.to_plain_text().to_string(),
+                    _ => content.to_plain_text().to_string(),
                 },
                 other => {
                     warn!("Unrecognised chat format '{other}', falling back to plain text.");
-                    content.to_plain_text()
+                    content.to_plain_text().to_string()
                 }
             };
             println!("[Chat] {text}");

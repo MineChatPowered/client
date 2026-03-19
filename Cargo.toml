@@ -31,4 +31,4 @@ serde_json = "1.0.139"
 thiserror = "2.0.11"
 tokio = { version = "1.41.1", features = ["full"] }
 minechat-protocol = { path = "../protocol", features = ["tokio", "tls-rustls", "cert-pinning"] }
-kyori-component-json = { path = "../kyori-component-json" }
+kyori-component-json = { git = "https://github.com/walker84837/kyori-component-json" }
