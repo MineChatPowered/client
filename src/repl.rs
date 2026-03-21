@@ -12,8 +12,6 @@ use rustyline::DefaultEditor;
 use std::path::PathBuf;
 use tokio::signal;
 
-static CHAT_FORMAT: &str = COMMONMARK;
-
 struct ReplState {
     use_components: bool,
     server_supports_components: bool,
@@ -23,7 +21,7 @@ struct ReplState {
 impl ReplState {
     fn new(server_supports_components: bool) -> Self {
         Self {
-            use_components: CHAT_FORMAT == COMPONENTS && server_supports_components,
+            use_components: false,
             server_supports_components,
             muted: false,
         }
@@ -55,7 +53,7 @@ impl ReplState {
 }
 
 fn history_path() -> Option<PathBuf> {
-    ProjectDirs::from("", "", "client").map(|dirs| dirs.data_dir().join("history"))
+    ProjectDirs::from("", "", "minechat").map(|dirs| dirs.data_dir().join("history"))
 }
 
 fn create_editor() -> rustyline::Result<DefaultEditor> {

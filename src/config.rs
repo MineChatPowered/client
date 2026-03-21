@@ -1,6 +1,7 @@
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
+use std::path::PathBuf;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ServerConfig {
@@ -16,19 +17,16 @@ pub struct ServerEntry {
     pub supports_components: bool,
 }
 
-pub fn config_path() -> Result<String, Box<dyn std::error::Error>> {
+pub fn config_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let proj_dirs = ProjectDirs::from("", "", "minechat").ok_or("Can't get config dir")?;
     let config_dir = proj_dirs.config_dir();
     fs::create_dir_all(config_dir)?;
-    Ok(config_dir
-        .join("servers.json")
-        .to_string_lossy()
-        .to_string())
+    Ok(config_dir.join("servers.json"))
 }
 
 pub fn load_config() -> Result<ServerConfig, Box<dyn std::error::Error>> {
     let path = config_path()?;
-    if !std::path::Path::new(&path).exists() {
+    if !path.exists() {
         return Ok(ServerConfig {
             servers: Vec::new(),
         });
@@ -39,6 +37,11 @@ pub fn load_config() -> Result<ServerConfig, Box<dyn std::error::Error>> {
 
 pub fn save_config(config: &ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     let path = config_path()?;
-    let file = File::create(path)?;
-    Ok(serde_json::to_writer_pretty(file, config)?)
+    let temp_path = path.with_extension("tmp");
+    {
+        let mut file = File::create(&temp_path)?;
+        serde_json::to_writer_pretty(&mut file, config)?;
+    }
+    std::fs::rename(&temp_path, &path)?;
+    Ok(())
 }

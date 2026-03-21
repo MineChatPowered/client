@@ -6,6 +6,18 @@ use minechat_protocol::{
     send_capabilities, wait_auth_ok,
 };
 
+fn parse_server_addr(addr: &str) -> Result<&str, String> {
+    let (host, port_str) = addr
+        .rsplit_once(':')
+        .ok_or("Invalid server address format. Expected format: host:port")?;
+
+    port_str
+        .parse::<u16>()
+        .map_err(|_| "Invalid port number. Must be between 1-65535")?;
+
+    Ok(host)
+}
+
 pub async fn set_link(
     server_addr: &str,
     code: &str,
@@ -17,13 +29,7 @@ pub async fn set_link(
 
     info!("Connecting to {} for linking...", server_addr);
 
-    let (host, port_str) = server_addr
-        .rsplit_once(':')
-        .ok_or("Invalid server address format. Expected format: host:port")?;
-
-    port_str
-        .parse::<u16>()
-        .map_err(|_| "Invalid port number. Must be between 1-65535")?;
+    let host = parse_server_addr(server_addr)?;
 
     let config = load_config()?;
     let pinned_cert = config
@@ -80,20 +86,14 @@ pub async fn handle_connect(
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Connecting to {}...", server_addr);
 
-    let config = load_config()?;
+    let host = parse_server_addr(server_addr)?;
+
+    let mut config = load_config()?;
     let entry = config
         .servers
         .iter()
         .find(|e| e.address == server_addr)
         .ok_or("Server not linked. Use --link to link first.")?;
-
-    let (host, port_str) = server_addr
-        .rsplit_once(':')
-        .ok_or("Invalid server address format. Expected format: host:port")?;
-
-    port_str
-        .parse::<u16>()
-        .map_err(|_| "Invalid port number. Must be between 1-65535")?;
 
     let mut message_stream = RustlsTlsMessageStream::connect_with_pinning(
         host,
@@ -117,7 +117,6 @@ pub async fn handle_connect(
 
     wait_auth_ok(&mut message_stream).await?;
 
-    let mut config = load_config()?;
     if let Some(server_entry) = config.servers.iter_mut().find(|e| e.address == server_addr) {
         server_entry.supports_components = use_components;
         save_config(&config)?;

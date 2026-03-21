@@ -71,8 +71,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     if let Some(code) = args.link {
-        set_link(&server_addr, &code, args.components).await
+        set_link(&server_addr, &code, args.components).await?;
     } else {
-        handle_connect(&server_addr, args.components).await
+        handle_connect(&server_addr, args.components).await?;
     }
+
+    Ok(())
 }
