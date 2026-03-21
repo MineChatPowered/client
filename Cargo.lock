@@ -749,6 +749,7 @@ dependencies = [
 [[package]]
 name = "minechat-protocol"
 version = "0.4.0"
+source = "git+https://github.com/MineChatPowered/protocol-rs#6f8032d4422932ff85bac4259c6184c8ec24e71e"
 dependencies = [
  "async-trait",
  "base64",

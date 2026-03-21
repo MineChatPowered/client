@@ -1,6 +1,6 @@
 use crate::config::{ServerEntry, load_config, save_config};
 use crate::repl::repl;
-use log::info;
+use log::{debug, info};
 use minechat_protocol::{
     MessageStream, RustlsTlsMessageStream, link_with_server, protocol::MineChatError,
     send_capabilities, wait_auth_ok,
@@ -52,7 +52,7 @@ pub async fn set_link(
     info!("Client UUID: {client_uuid}");
     info!("Minecraft UUID: {minecraft_uuid}");
 
-    info!("Sending capabilities...");
+    debug!("Sending capabilities...");
     send_capabilities(&mut message_stream, use_components).await?;
 
     wait_auth_ok(&mut message_stream).await?;

@@ -81,6 +81,7 @@ pub async fn repl(
     let mut state = ReplState::new(server_supports_components);
 
     println!("MineChat CLI - Type /help for commands, Ctrl+C to exit");
+    println!("Tip: Use up/down arrows for history");
 
     loop {
         tokio::select! {
@@ -134,9 +135,6 @@ pub async fn repl(
     }
 }
 
-/// Process one line of user input.
-///
-/// Returns `true` if the REPL should exit after this call.
 async fn handle_input(
     stream: &mut (dyn MessageStream + Unpin + Send),
     input: &str,
@@ -157,7 +155,6 @@ async fn handle_input(
         return Ok(false);
     }
 
-    // Plain chat message.
     if state.muted {
         println!("You are currently muted and cannot send messages.");
         return Ok(false);
@@ -174,16 +171,12 @@ async fn handle_input(
     Ok(false)
 }
 
-/// Dispatch an inbound packet from the server.
-///
-/// Returns `true` if the REPL should disconnect and exit.
 async fn handle_server_packet(
     packet: MineChatPacket,
     stream: &mut (dyn MessageStream + Unpin + Send),
     state: &mut ReplState,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     match packet {
-        // Keep-alive - respond immediately
         MineChatPacket::Ping { timestamp_ms } => {
             debug!("Received PING ({timestamp_ms}), sending PONG.");
             send_pong(stream, timestamp_ms).await?;
@@ -216,7 +209,6 @@ async fn handle_server_packet(
             let reason_str = reason.as_deref().unwrap_or("(no reason given)");
 
             match action.value() {
-                // warn
                 0 => {
                     warn!(
                         "Moderation: warn | scope={} | reason={reason_str}",
@@ -224,7 +216,6 @@ async fn handle_server_packet(
                     );
                     println!("[Warning] {reason_str}");
                 }
-                // mute
                 1 => {
                     state.muted = true;
                     println!("[Muted] {reason_str}");
@@ -232,12 +223,10 @@ async fn handle_server_packet(
                         println!("  Duration: {secs} seconds");
                     }
                 }
-                // kick
                 2 => {
                     println!("[Kicked] {reason_str}");
                     return Ok(true);
                 }
-                // ban
                 3 => {
                     println!("[Banned] {reason_str}");
                     return Ok(true);
@@ -251,7 +240,6 @@ async fn handle_server_packet(
             }
         }
 
-        // Server-initiated disconnect (system event)
         MineChatPacket::SystemDisconnect {
             reason_code,
             message,
@@ -268,7 +256,6 @@ async fn handle_server_packet(
             return Ok(true);
         }
 
-        // Anything else - log at debug level and move on
         other => {
             debug!("Ignored unhandled packet: {other:?}");
         }
