@@ -1,12 +1,14 @@
 # MineCLI - MineChat Client
 
-[![CI status](https://github.com/walker84837/minechat-client/actions/workflows/rust.yml/badge.svg)](https://github.com/walker84837/minechat-client/actions/workflows/rust.yml)
+[![CI status](https://github.com/MineChatPowered/client/actions/workflows/rust.yml/badge.svg)](https://github.com/MineChatPowered/client/actions/workflows/rust.yml)
 
 This repo is for the CLI client, which enables you to chat on a Minecraft server without actually logging in to the Minecraft account itself.
 
 Related projects:
-- [MineChat Server](https://github.com/walker84837/MineChat-Server): the Minecraft plugin which acts as the server-side component of MineChat
-- [minechat-protocol](https://github.com/walker84837/minechat-protocol): the Rust library which lays down the base and helper functions to use the protocol
+- [MineChatPowered/server](https://github.com/MineChatPowered/server): the Minecraft plugin which acts as the server-side component of MineChat
+- [MineChatPowered/protocol-rs](https://github.com/MineChatPowered/protocol-rs): the Rust library which lays down the base and helper functions to use the protocol
+
+*Not affiliated with or endorsed by Mojang Studios or Minecraft.*
 
 ## Features
 
@@ -21,7 +23,7 @@ To build the client, you need to [install](https://www.rust-lang.org/tools/insta
 1. **Clone the repository:**
 
    ```bash
-   git clone https://github.com/walker84837/minechat-client.git
+   git clone https://github.com/MineChatPowered/client.git
    cd minechat-client
    ```
 
@@ -37,7 +39,7 @@ To build the client, you need to [install](https://www.rust-lang.org/tools/insta
 
 Before running the client, ensure that the server part is running either locally or on a remote server:
 
-- If you run the server, download the [server plugin](https://github.com/walker84837/MineChat-Server/releases/latest).
+- If you run the server, download the [server plugin](https://github.com/MineChatPowered/server/releases/latest).
 - Start the server which contains the server part of the platform.
 - Log on to the Minecraft server and run `/link` to generate a code.
 - Use the generated code to link your account with the Minecraft server.
@@ -87,7 +89,7 @@ Each entry represents a server you have linked with a unique client UUID.
 
 ## Contributing
 
-Contributions are welcome! Feel free to open issues or pull requests on the [GitHub repository](https://github.com/walker84837/minechat-client).
+Contributions are welcome! Feel free to open issues or pull requests on the [GitHub repository](https://github.com/MineChatPowered/client).
 
 ### Roadmap
 
