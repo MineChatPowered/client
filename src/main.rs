@@ -58,10 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     init_logger(args.verbose);
 
-    info!(
-        "Connecting to {} (port {})",
-        args.host, args.port
-    );
+    info!("Connecting to {} (port {})", args.host, args.port);
     info!(
         "Chat format: {}",
         if args.components {

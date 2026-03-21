@@ -1,24 +1,22 @@
+use directories::ProjectDirs;
 use kyori_component_json::Component;
 use log::{debug, info, warn};
-use minechat_protocol::{
-    packets::MineChatPacket,
-    protocol::{MessageStream, MineChatError, chat_format::COMMONMARK, chat_format::COMPONENTS},
-    send_chat_message, send_pong,
-    types::MessageContent,
+use minechat_protocol::protocol::{
+    MessageStream, MineChatError,
+    chat_format::{COMMONMARK, COMPONENTS},
 };
-use tokio::io::{AsyncBufReadExt, BufReader};
+use minechat_protocol::{
+    packets::MineChatPacket, send_chat_message, send_pong, types::MessageContent,
+};
+use rustyline::DefaultEditor;
+use std::path::PathBuf;
 use tokio::signal;
 
 static CHAT_FORMAT: &str = COMMONMARK;
 
 struct ReplState {
-    /// Whether the client will send outgoing messages as Minecraft text
-    /// components. Only true when both the preferred format and the server
-    /// capability agree.
     use_components: bool,
-    /// Cached from the AUTH handshake so that `/format` can enforce it.
     server_supports_components: bool,
-    /// Set to true when the server sends a MODERATION mute action.
     muted: bool,
 }
 
@@ -39,7 +37,6 @@ impl ReplState {
         }
     }
 
-    /// Toggle the outgoing chat format, respecting server capability.
     fn toggle_format(&mut self) {
         if !self.use_components && !self.server_supports_components {
             println!("Server does not support the 'components' format; staying on 'commonmark'.");
@@ -57,13 +54,33 @@ impl ReplState {
     }
 }
 
+fn history_path() -> Option<PathBuf> {
+    ProjectDirs::from("", "", "client").map(|dirs| dirs.data_dir().join("history"))
+}
+
+fn create_editor() -> rustyline::Result<DefaultEditor> {
+    let mut editor = DefaultEditor::new()?;
+
+    if let Some(history_path) = history_path() {
+        if let Some(parent) = history_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        if let Err(e) = editor.load_history(&history_path) {
+            debug!("Could not load history: {}", e);
+        }
+    }
+
+    Ok(editor)
+}
+
 pub async fn repl(
     stream: &mut (dyn MessageStream + Unpin + Send),
     server_supports_components: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut stdin = BufReader::new(tokio::io::stdin());
-    let mut buffer = String::new();
+    let mut editor = create_editor()?;
     let mut state = ReplState::new(server_supports_components);
+
+    println!("MineChat CLI - Type /help for commands, Ctrl+C to exit");
 
     loop {
         tokio::select! {
@@ -85,18 +102,18 @@ pub async fn repl(
                 }
             }
 
-            result = stdin.read_line(&mut buffer) => {
-                let n = result?;
-
-                // EOF - exit cleanly (socket closed = disconnection)
-                if n == 0 {
-                    info!("Exiting.");
-                    return Ok(());
-                }
-
-                // Trim and clear immediately so we never forget to reset the buffer
-                let input = buffer.trim().to_string();
-                buffer.clear();
+            _ = tokio::task::yield_now() => {
+                let input = match editor.readline("> ") {
+                    Ok(line) => line,
+                    Err(rustyline::error::ReadlineError::Eof) => {
+                        info!("Exiting.");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!("Readline error: {}", e);
+                        continue;
+                    }
+                };
 
                 if input.is_empty() {
                     continue;
@@ -105,6 +122,8 @@ pub async fn repl(
                 if handle_input(stream, &input, &mut state).await? {
                     return Ok(());
                 }
+
+                let _ = editor.add_history_entry(&input);
             }
 
             _ = signal::ctrl_c() => {
@@ -233,7 +252,10 @@ async fn handle_server_packet(
         }
 
         // Server-initiated disconnect (system event)
-        MineChatPacket::SystemDisconnect { reason_code, message } => {
+        MineChatPacket::SystemDisconnect {
+            reason_code,
+            message,
+        } => {
             let reason_name = match reason_code {
                 0 => "Shutdown",
                 1 => "Maintenance",
