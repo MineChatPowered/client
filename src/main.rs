@@ -1,6 +1,6 @@
 use clap::Parser;
 use env_logger::{Builder, Target};
-use log::{LevelFilter, info};
+use log::{info, LevelFilter};
 
 use crate::connect::{handle_connect, set_link};
 

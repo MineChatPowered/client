@@ -1,7 +1,7 @@
 use crate::config::{ServerEntry, load_config, save_config};
 use crate::repl::repl;
 use log::{debug, info};
-use minechat_protocol::{
+use minechat::{
     MessageStream, RustlsTlsMessageStream, link_with_server, protocol::MineChatError,
     send_capabilities, wait_auth_ok,
 };
@@ -59,7 +59,13 @@ pub async fn set_link(
     info!("Minecraft UUID: {minecraft_uuid}");
 
     debug!("Sending capabilities...");
-    send_capabilities(&mut message_stream, use_components).await?;
+    let supported_formats = vec!["components".to_string(), "commonmark".to_string()];
+    let preferred_format = if use_components {
+        Some("components".to_string())
+    } else {
+        Some("commonmark".to_string())
+    };
+    send_capabilities(&mut message_stream, supported_formats, preferred_format).await?;
 
     wait_auth_ok(&mut message_stream).await?;
     info!("Authentication complete!");
@@ -73,7 +79,7 @@ pub async fn set_link(
         client_uuid,
         minecraft_uuid,
         pinned_cert,
-        supports_components: false,
+        supports_components: true, // Always support components now
     });
     save_config(&config)?;
 
@@ -113,12 +119,18 @@ pub async fn handle_connect(
         link_with_server(&mut message_stream, Some(entry.client_uuid.clone()), "").await?;
 
     info!("Sending capabilities...");
-    send_capabilities(&mut message_stream, use_components).await?;
+    let supported_formats = vec!["components".to_string(), "commonmark".to_string()];
+    let preferred_format = if use_components {
+        Some("components".to_string())
+    } else {
+        Some("commonmark".to_string())
+    };
+    send_capabilities(&mut message_stream, supported_formats, preferred_format).await?;
 
     wait_auth_ok(&mut message_stream).await?;
 
     if let Some(server_entry) = config.servers.iter_mut().find(|e| e.address == server_addr) {
-        server_entry.supports_components = use_components;
+        server_entry.supports_components = true; // Client always supports components now
         save_config(&config)?;
     }
 

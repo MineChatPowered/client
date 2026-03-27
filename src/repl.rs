@@ -1,12 +1,15 @@
 use directories::ProjectDirs;
-use kyori_component_json::Component;
 use log::{debug, info, warn};
-use minechat_protocol::protocol::{
-    MessageStream, MineChatError,
-    chat_format::{COMMONMARK, COMPONENTS},
-};
-use minechat_protocol::{
-    packets::MineChatPacket, send_chat_message, send_pong, types::MessageContent,
+use minechat::{
+    components::Component,
+    message_content_to_ansi,
+    packets::MineChatPacket,
+    protocol::{
+        MessageStream, MineChatError,
+        chat_format::{COMMONMARK, COMPONENTS},
+    },
+    send_chat_message, send_pong,
+    types::MessageContent,
 };
 use rustyline::DefaultEditor;
 use std::path::PathBuf;
@@ -14,15 +17,13 @@ use tokio::signal;
 
 struct ReplState {
     use_components: bool,
-    server_supports_components: bool,
     muted: bool,
 }
 
 impl ReplState {
-    fn new(server_supports_components: bool) -> Self {
+    fn new() -> Self {
         Self {
             use_components: false,
-            server_supports_components,
             muted: false,
         }
     }
@@ -36,10 +37,6 @@ impl ReplState {
     }
 
     fn toggle_format(&mut self) {
-        if !self.use_components && !self.server_supports_components {
-            println!("Server does not support the 'components' format; staying on 'commonmark'.");
-            return;
-        }
         self.use_components = !self.use_components;
         println!(
             "Chat format switched to: {}",
@@ -73,10 +70,10 @@ fn create_editor() -> rustyline::Result<DefaultEditor> {
 
 pub async fn repl(
     stream: &mut (dyn MessageStream + Unpin + Send),
-    server_supports_components: bool,
+    _server_supports_components: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut editor = create_editor()?;
-    let mut state = ReplState::new(server_supports_components);
+    let mut state = ReplState::new();
 
     println!("MineChat CLI - Type /help for commands, Ctrl+C to exit");
     println!("Tip: Use up/down arrows for history");
@@ -186,16 +183,14 @@ async fn handle_server_packet(
                     MessageContent::CommonMark(ref t) => t.clone(),
                     _ => content.to_plain_text().to_string(),
                 },
-                COMPONENTS => match content {
-                    MessageContent::Components(ref c) => c.to_plain_text().to_string(),
-                    _ => content.to_plain_text().to_string(),
-                },
+                COMPONENTS => message_content_to_ansi(&content),
                 other => {
                     warn!("Unrecognised chat format '{other}', falling back to plain text.");
                     content.to_plain_text().to_string()
                 }
             };
             println!("[Chat] {text}");
+            print!("\x1b[0m");
         }
 
         MineChatPacket::Moderation {

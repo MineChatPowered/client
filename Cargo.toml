@@ -7,7 +7,7 @@ repository = "https://github.com/MineChatPowered/client"
 description = "The client implementation of MineChat, letting you chat with people over on Minecraft"
 authors = ["walker84837"]
 readme = "README.md"
-rust-version = "1.85.0"
+rust-version = "1.88.0"
 keywords = ["chat-client", "cli", "networking", "async", "tcp"]
 categories = ["command-line-utilities", "network-programming", "authentication", "config"]
 
@@ -30,6 +30,5 @@ serde = { version = "1.0.218", features = ["derive"] }
 serde_json = "1.0.139"
 thiserror = "2.0.11"
 tokio = { version = "1.41.1", features = ["full"] }
-minechat-protocol = { git = "https://github.com/MineChatPowered/protocol-rs" }
-kyori-component-json = { git = "https://github.com/walker84837/kyori-component-json" }
+minechat = { package = "minechat-protocol", git = "https://github.com/MineChatPowered/protocol-rs" }
 rustyline = { version = "17.0.2", features = ["derive", "with-file-history"] }
