@@ -1,8 +1,9 @@
-use directories::ProjectDirs;
+use crate::connect::NetworkCommand;
+
 use log::{debug, info, warn};
+
 use minechat::{
-    components::Component,
-    message_content_to_ansi,
+    RustlsTlsMessageStream, message_content_to_ansi,
     packets::MineChatPacket,
     protocol::{
         MessageStream, MineChatError,
@@ -11,9 +12,13 @@ use minechat::{
     send_chat_message, send_pong,
     types::MessageContent,
 };
-use rustyline::DefaultEditor;
-use std::path::PathBuf;
-use tokio::signal;
+
+use std::ops::ControlFlow;
+use std::sync::Arc;
+
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::{Mutex, mpsc};
+use tokio::time::{Duration, timeout};
 
 struct ReplState {
     use_components: bool,
@@ -25,14 +30,6 @@ impl ReplState {
         Self {
             use_components: false,
             muted: false,
-        }
-    }
-
-    fn current_format(&self) -> &'static str {
-        if self.use_components {
-            COMPONENTS
-        } else {
-            COMMONMARK
         }
     }
 
@@ -49,150 +46,134 @@ impl ReplState {
     }
 }
 
-fn history_path() -> Option<PathBuf> {
-    ProjectDirs::from("", "", "minechat").map(|dirs| dirs.data_dir().join("history"))
-}
-
-fn create_editor() -> rustyline::Result<DefaultEditor> {
-    let mut editor = DefaultEditor::new()?;
-
-    if let Some(history_path) = history_path() {
-        if let Some(parent) = history_path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        if let Err(e) = editor.load_history(&history_path) {
-            debug!("Could not load history: {}", e);
-        }
-    }
-
-    Ok(editor)
-}
-
-pub async fn repl(
-    stream: &mut (dyn MessageStream + Unpin + Send),
-    _server_supports_components: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut editor = create_editor()?;
-    let mut state = ReplState::new();
-
-    println!("MineChat CLI - Type /help for commands, Ctrl+C to exit");
-    println!("Tip: Use up/down arrows for history");
-
+async fn network_task(
+    stream: Arc<Mutex<RustlsTlsMessageStream>>,
+    packet_tx: mpsc::Sender<Result<MineChatPacket, MineChatError>>,
+    mut send_rx: mpsc::Receiver<NetworkCommand>,
+    mut shutdown_rx: mpsc::Receiver<()>,
+) {
     loop {
         tokio::select! {
-            result = stream.receive_packet() => {
+            result = async {
+                let mut stream = stream.lock().await;
+                stream.receive_packet().await
+            } => {
+                debug!("[NETWORK] Received packet: {:?}", result);
                 match result {
                     Ok(packet) => {
-                        if handle_server_packet(packet, stream, &mut state).await? {
-                            return Ok(());
+                        if packet_tx.send(Ok(packet)).await.is_err() {
+                            break;
                         }
                     }
-                    Err(MineChatError::Disconnected) => {
-                        info!("Server disconnected.");
-                        return Ok(());
-                    }
                     Err(e) => {
-                        warn!("Error receiving packet: {e}");
-                        return Err(e.into());
+                        let _ = packet_tx.send(Err(e)).await;
+                        break;
                     }
                 }
             }
-
-            _ = tokio::task::yield_now() => {
-                let input = match editor.readline("> ") {
-                    Ok(line) => line,
-                    Err(rustyline::error::ReadlineError::Eof) => {
-                        info!("Exiting.");
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        warn!("Readline error: {}", e);
-                        continue;
-                    }
-                };
-
-                if input.is_empty() {
-                    continue;
-                }
-
-                if handle_input(stream, &input, &mut state).await? {
-                    return Ok(());
-                }
-
-                let _ = editor.add_history_entry(&input);
+            _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                // Small tick to check for outgoing commands
             }
-
-            _ = signal::ctrl_c() => {
-                info!("Received Ctrl+C, exiting.");
-                return Ok(());
+            _ = shutdown_rx.recv() => {
+                break;
             }
+        }
+
+        // Check for outgoing commands (non-blocking)
+        while let Ok(msg) = send_rx.try_recv() {
+            match msg {
+                NetworkCommand::SendChat(content) => {
+                    let mut stream = stream.lock().await;
+                    let _ = send_chat_message(&mut *stream, COMMONMARK, &content).await;
+                }
+                NetworkCommand::SendPong(ts) => {
+                    let mut stream = stream.lock().await;
+                    let _ = send_pong(&mut *stream, ts).await;
+                }
+            }
+        }
+    }
+
+    info!("Network task shutdown");
+}
+
+fn format_chat_message(format: &str, content: &MessageContent) -> String {
+    match format {
+        COMMONMARK => match content {
+            MessageContent::CommonMark(t) => t.clone(),
+            _ => content.to_plain_text().to_string(),
+        },
+        COMPONENTS => message_content_to_ansi(content),
+        other => {
+            warn!(
+                "Unrecognised chat format '{}', falling back to plain text.",
+                other
+            );
+            content.to_plain_text().to_string()
         }
     }
 }
 
-async fn handle_input(
-    stream: &mut (dyn MessageStream + Unpin + Send),
-    input: &str,
-    state: &mut ReplState,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    if let Some(cmd) = input.strip_prefix('/') {
-        match cmd {
-            "exit" | "quit" => {
-                info!("Exiting.");
-                return Ok(true);
-            }
-            "format" => state.toggle_format(),
-            "help" => {
-                println!("Available commands: /exit, /quit, /format, /help");
-            }
-            _ => warn!("Unknown command: /{cmd}. Available commands: /exit, /quit, /format, /help"),
+fn handle_moderation(
+    action: i32,
+    scope: i32,
+    reason: &str,
+    duration_seconds: Option<i32>,
+) -> ControlFlow<()> {
+    match action {
+        0 => {
+            warn!("Moderation: warn | scope={} | reason={}", scope, reason);
+            println!("[Warning] {reason}");
+            ControlFlow::Continue(())
         }
-        return Ok(false);
+        1 => {
+            println!("[Muted] {reason}");
+            if let Some(secs) = duration_seconds {
+                println!("  Duration: {secs} seconds");
+            }
+            ControlFlow::Continue(())
+        }
+        2 => {
+            println!("[Kicked] {reason}");
+            info!("Kicked from server: {}", reason);
+            ControlFlow::Break(())
+        }
+        3 => {
+            println!("[Banned] {reason}");
+            info!("Banned from server: {}", reason);
+            ControlFlow::Break(())
+        }
+        other => {
+            warn!(
+                "Unknown moderation action {} | scope={} | reason={}",
+                other, scope, reason
+            );
+            ControlFlow::Continue(())
+        }
     }
-
-    if state.muted {
-        println!("You are currently muted and cannot send messages.");
-        return Ok(false);
-    }
-
-    let format = state.current_format();
-    let content = if state.use_components {
-        serde_json::to_string(&Component::text(input))?
-    } else {
-        input.to_owned()
-    };
-    send_chat_message(stream, format, &content).await?;
-
-    Ok(false)
 }
 
-async fn handle_server_packet(
+fn handle_packet(
     packet: MineChatPacket,
-    stream: &mut (dyn MessageStream + Unpin + Send),
-    state: &mut ReplState,
-) -> Result<bool, Box<dyn std::error::Error>> {
+    send_tx: &mpsc::Sender<NetworkCommand>,
+) -> ControlFlow<()> {
     match packet {
         MineChatPacket::Ping { timestamp_ms } => {
             debug!("Received PING ({timestamp_ms}), sending PONG.");
-            send_pong(stream, timestamp_ms).await?;
+            if let Err(e) = send_tx.try_send(NetworkCommand::SendPong(timestamp_ms)) {
+                warn!("Error sending pong: {}", e);
+            }
+            ControlFlow::Continue(())
         }
-
         MineChatPacket::ChatMessage { format, content } => {
-            let text = match format.as_str() {
-                COMMONMARK => match content {
-                    MessageContent::CommonMark(ref t) => t.clone(),
-                    _ => content.to_plain_text().to_string(),
-                },
-                COMPONENTS => message_content_to_ansi(&content),
-                other => {
-                    warn!("Unrecognised chat format '{other}', falling back to plain text.");
-                    content.to_plain_text().to_string()
-                }
-            };
+            debug!(
+                "[MAIN] Processing ChatMessage: format={:?}, content={:?}",
+                format, content
+            );
+            let text = format_chat_message(format.as_str(), &content);
             println!("[Chat] {text}");
-            print!("\x1b[0m");
+            ControlFlow::Continue(())
         }
-
         MineChatPacket::Moderation {
             action,
             scope,
@@ -200,39 +181,8 @@ async fn handle_server_packet(
             duration_seconds,
         } => {
             let reason_str = reason.as_deref().unwrap_or("(no reason given)");
-
-            match action.value() {
-                0 => {
-                    warn!(
-                        "Moderation: warn | scope={} | reason={reason_str}",
-                        scope.value()
-                    );
-                    println!("[Warning] {reason_str}");
-                }
-                1 => {
-                    state.muted = true;
-                    println!("[Muted] {reason_str}");
-                    if let Some(secs) = duration_seconds {
-                        println!("  Duration: {secs} seconds");
-                    }
-                }
-                2 => {
-                    println!("[Kicked] {reason_str}");
-                    return Ok(true);
-                }
-                3 => {
-                    println!("[Banned] {reason_str}");
-                    return Ok(true);
-                }
-                other => {
-                    warn!(
-                        "Unknown moderation action {other} | scope={} | reason={reason_str}",
-                        scope.value()
-                    );
-                }
-            }
+            handle_moderation(action.value(), scope.value(), reason_str, duration_seconds)
         }
-
         MineChatPacket::SystemDisconnect {
             reason_code,
             message,
@@ -245,14 +195,141 @@ async fn handle_server_packet(
                 _ => "Unknown",
             };
             println!("[Server] Disconnected: {reason_name} - {message}");
-            info!("Disconnected by server: {reason_name}");
-            return Ok(true);
+            info!("Disconnected by server: {}", reason_name);
+            ControlFlow::Break(())
         }
-
         other => {
-            debug!("Ignored unhandled packet: {other:?}");
+            debug!("Ignored unhandled packet: {:?}", other);
+            ControlFlow::Continue(())
+        }
+    }
+}
+
+fn handle_stdin_command(
+    cmd: &str,
+    state: &mut ReplState,
+    shutdown_tx: &mpsc::Sender<()>,
+) -> ControlFlow<()> {
+    match cmd {
+        "exit" | "quit" => {
+            println!("Exiting.");
+            let _ = shutdown_tx.try_send(());
+            ControlFlow::Break(())
+        }
+        "format" => {
+            state.toggle_format();
+            ControlFlow::Continue(())
+        }
+        "help" => {
+            println!("Available commands: /exit, /quit, /format, /help");
+            ControlFlow::Continue(())
+        }
+        _ => {
+            println!(
+                "Unknown command: /{}. Available commands: /exit, /quit, /format, /help",
+                cmd
+            );
+            ControlFlow::Continue(())
+        }
+    }
+}
+
+fn handle_stdin_line(
+    line: &str,
+    state: &mut ReplState,
+    send_tx: &mpsc::Sender<NetworkCommand>,
+    shutdown_tx: &mpsc::Sender<()>,
+) -> ControlFlow<()> {
+    if line.is_empty() {
+        info!("Exiting.");
+        let _ = shutdown_tx.try_send(());
+        return ControlFlow::Break(());
+    }
+
+    if let Some(cmd) = line.strip_prefix('/') {
+        handle_stdin_command(cmd, state, shutdown_tx)
+    } else if !state.muted {
+        if let Err(e) = send_tx.try_send(NetworkCommand::SendChat(line.to_string())) {
+            warn!("Error sending message: {}", e);
+            println!("Error: {}", e);
+        }
+        ControlFlow::Continue(())
+    } else {
+        println!("You are currently muted and cannot send messages.");
+        ControlFlow::Continue(())
+    }
+}
+
+pub async fn repl(stream: RustlsTlsMessageStream) -> Result<(), Box<dyn std::error::Error>> {
+    let mut state = ReplState::new();
+
+    println!("MineChat CLI - Type /help for commands, Ctrl+C to exit");
+    println!("Tip: Use up/down arrows for history");
+
+    let (packet_tx, mut packet_rx) = mpsc::channel(100);
+    let (send_tx, send_rx) = mpsc::channel(32);
+    let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+
+    let stream = Arc::new(Mutex::new(stream));
+    let stream_for_network = Arc::clone(&stream);
+
+    tokio::spawn(network_task(
+        stream_for_network,
+        packet_tx,
+        send_rx,
+        shutdown_rx,
+    ));
+
+    let stdin = tokio::io::stdin();
+    let mut reader = BufReader::new(stdin).lines();
+
+    loop {
+        tokio::select! {
+            result = timeout(Duration::from_millis(100), packet_rx.recv()) => {
+                match result {
+                    Ok(Some(Ok(packet))) => {
+                        debug!("[MAIN] Received packet: {:?}", packet);
+                        if handle_packet(packet, &send_tx).is_break() {
+                            break;
+                        }
+                    }
+                    Ok(Some(Err(MineChatError::Disconnected))) => {
+                        info!("Server disconnected.");
+                        break;
+                    }
+                    Ok(Some(Err(e))) => {
+                        warn!("Error receiving packet: {}", e);
+                        return Err(e.into());
+                    }
+                    Ok(None) => {
+                        info!("Network channel closed, exiting.");
+                        break;
+                    }
+                    Err(_) => {
+                        // timeout, continue
+                    }
+                }
+            }
+            result = reader.next_line() => {
+                match result {
+                    Ok(Some(line)) => {
+                        if handle_stdin_line(&line, &mut state, &send_tx, &shutdown_tx).is_break() {
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        info!("EOF received, exiting.");
+                        break;
+                    }
+                    Err(e) => {
+                        debug!("Readline error: {}", e);
+                        break;
+                    }
+                }
+            }
         }
     }
 
-    Ok(false)
+    info!("REPL exiting");
+    Ok(())
 }

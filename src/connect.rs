@@ -2,9 +2,15 @@ use crate::config::{ServerEntry, load_config, save_config};
 use crate::repl::repl;
 use log::{debug, info};
 use minechat::{
-    MessageStream, RustlsTlsMessageStream, link_with_server, protocol::MineChatError,
-    send_capabilities, wait_auth_ok,
+    RustlsTlsMessageStream, link_with_server, protocol::MineChatError, send_capabilities,
+    wait_auth_ok,
 };
+
+#[derive(Debug, Clone)]
+pub enum NetworkCommand {
+    SendChat(String),
+    SendPong(i64),
+}
 
 fn parse_server_addr(addr: &str) -> Result<&str, String> {
     let (host, port_str) = addr
@@ -16,6 +22,17 @@ fn parse_server_addr(addr: &str) -> Result<&str, String> {
         .map_err(|_| "Invalid port number. Must be between 1-65535")?;
 
     Ok(host)
+}
+
+fn map_tls_error(e: MineChatError) -> String {
+    match e {
+        MineChatError::ConfigError(ref msg) if msg.contains("certificate") => {
+            format!(
+                "Certificate verification failed: {msg}. This may indicate a MITM attack or server certificate change."
+            )
+        }
+        _ => format!("TLS connection failed: {e}"),
+    }
 }
 
 pub async fn set_link(
@@ -38,18 +55,10 @@ pub async fn set_link(
         .find(|e| e.address == server_addr)
         .and_then(|e| e.pinned_cert.clone());
 
-    let mut message_stream = RustlsTlsMessageStream::connect_with_pinning(
-        host,
-        server_addr,
-        pinned_cert.as_deref(),
-    )
-    .await
-    .map_err(|e| match e {
-        MineChatError::ConfigError(ref msg) if msg.contains("certificate") => {
-            format!("Certificate verification failed: {msg}. This may indicate a MITM attack or server certificate change.")
-        }
-        _ => format!("TLS connection failed: {e}"),
-    })?;
+    let mut message_stream =
+        RustlsTlsMessageStream::connect_with_pinning(host, server_addr, pinned_cert.as_deref())
+            .await
+            .map_err(map_tls_error)?;
 
     info!("Sending LINK packet...");
     let (client_uuid, minecraft_uuid) = link_with_server(&mut message_stream, None, code).await?;
@@ -79,7 +88,7 @@ pub async fn set_link(
         client_uuid,
         minecraft_uuid,
         pinned_cert,
-        supports_components: true, // Always support components now
+        supports_components: true,
     });
     save_config(&config)?;
 
@@ -107,16 +116,10 @@ pub async fn handle_connect(
         entry.pinned_cert.as_deref(),
     )
     .await
-    .map_err(|e| match e {
-        MineChatError::ConfigError(ref msg) if msg.contains("certificate") => {
-            format!("Certificate verification failed: {msg}. This may indicate a MITM attack or server certificate change.")
-        }
-        _ => format!("TLS connection failed: {e}"),
-    })?;
+    .map_err(map_tls_error)?;
 
     info!("Authenticating with existing client UUID...");
-    let (_client_uuid, _minecraft_uuid) =
-        link_with_server(&mut message_stream, Some(entry.client_uuid.clone()), "").await?;
+    let _ = link_with_server(&mut message_stream, Some(entry.client_uuid.clone()), "").await?;
 
     info!("Sending capabilities...");
     let supported_formats = vec!["components".to_string(), "commonmark".to_string()];
@@ -130,7 +133,7 @@ pub async fn handle_connect(
     wait_auth_ok(&mut message_stream).await?;
 
     if let Some(server_entry) = config.servers.iter_mut().find(|e| e.address == server_addr) {
-        server_entry.supports_components = true; // Client always supports components now
+        server_entry.supports_components = true;
         save_config(&config)?;
     }
 
@@ -138,9 +141,5 @@ pub async fn handle_connect(
         "Connected successfully! Type /exit to quit, /format to switch between CommonMark and components."
     );
 
-    repl(
-        &mut message_stream as &mut (dyn MessageStream + Unpin + Send),
-        use_components,
-    )
-    .await
+    repl(message_stream).await
 }

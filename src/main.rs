@@ -1,6 +1,6 @@
 use clap::Parser;
 use env_logger::{Builder, Target};
-use log::{info, LevelFilter};
+use log::{LevelFilter, info};
 
 use crate::connect::{handle_connect, set_link};
 
@@ -42,9 +42,9 @@ struct Args {
 fn init_logger(verbose: bool) {
     let mut builder = Builder::from_default_env();
 
-    builder.target(Target::Stdout);
+    builder.target(Target::Stderr);
     builder.filter_level(if verbose {
-        LevelFilter::Debug
+        LevelFilter::Trace
     } else {
         LevelFilter::Info
     });
