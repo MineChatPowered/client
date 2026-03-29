@@ -15,10 +15,11 @@ use minechat::{
 
 use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex, mpsc};
-use tokio::time::{Duration, timeout};
+use tokio::time::{self, Duration, Instant};
 
 struct ReplState {
     use_components: bool,
@@ -52,13 +53,21 @@ async fn network_task(
     mut send_rx: mpsc::Receiver<NetworkCommand>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
+    let mut keepalive = time::interval(Duration::from_secs(15));
+    let mut last_receive = Instant::now();
+
     loop {
         tokio::select! {
+            biased;
+            _ = shutdown_rx.recv() => {
+                break;
+            }
             result = async {
                 let mut stream = stream.lock().await;
                 stream.receive_packet().await
             } => {
                 debug!("[NETWORK] Received packet: {:?}", result);
+                last_receive = Instant::now();
                 match result {
                     Ok(packet) => {
                         if packet_tx.send(Ok(packet)).await.is_err() {
@@ -71,24 +80,31 @@ async fn network_task(
                     }
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(5)) => {
-                // Small tick to check for outgoing commands
-            }
-            _ = shutdown_rx.recv() => {
-                break;
-            }
-        }
-
-        // Check for outgoing commands (non-blocking)
-        while let Ok(msg) = send_rx.try_recv() {
-            match msg {
-                NetworkCommand::SendChat(content) => {
-                    let mut stream = stream.lock().await;
-                    let _ = send_chat_message(&mut *stream, COMMONMARK, &content).await;
+            msg = send_rx.recv() => {
+                match msg {
+                    Some(NetworkCommand::SendChat(content)) => {
+                        let mut stream = stream.lock().await;
+                        let _ = send_chat_message(&mut *stream, COMMONMARK, &content).await;
+                    }
+                    Some(NetworkCommand::SendPong(ts)) => {
+                        let mut stream = stream.lock().await;
+                        let _ = send_pong(&mut *stream, ts).await;
+                    }
+                    None => break,
                 }
-                NetworkCommand::SendPong(ts) => {
+            }
+            _ = keepalive.tick() => {
+                if last_receive.elapsed() >= Duration::from_secs(15) {
+                    let ts = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64;
+                    debug!("Keep-alive: sending PING ({ts})");
+                    let ping = MineChatPacket::Ping { timestamp_ms: ts };
                     let mut stream = stream.lock().await;
-                    let _ = send_pong(&mut *stream, ts).await;
+                    if stream.send_packet(&ping).await.is_err() {
+                        break;
+                    }
                 }
             }
         }
@@ -120,26 +136,31 @@ fn handle_moderation(
     reason: &str,
     duration_seconds: Option<i32>,
 ) -> ControlFlow<()> {
+    let scope_label = match scope {
+        0 => "device",
+        1 => "account",
+        _ => "unknown scope",
+    };
     match action {
         0 => {
             warn!("Moderation: warn | scope={} | reason={}", scope, reason);
-            println!("[Warning] {reason}");
+            println!("[Warning - {scope_label}] {reason}");
             ControlFlow::Continue(())
         }
         1 => {
-            println!("[Muted] {reason}");
+            println!("[Muted - {scope_label}] {reason}");
             if let Some(secs) = duration_seconds {
                 println!("  Duration: {secs} seconds");
             }
             ControlFlow::Continue(())
         }
         2 => {
-            println!("[Kicked] {reason}");
+            println!("[Kicked - {scope_label}] {reason}");
             info!("Kicked from server: {}", reason);
             ControlFlow::Break(())
         }
         3 => {
-            println!("[Banned] {reason}");
+            println!("[Banned - {scope_label}] {reason}");
             info!("Banned from server: {}", reason);
             ControlFlow::Break(())
         }
@@ -285,7 +306,7 @@ pub async fn repl(stream: RustlsTlsMessageStream) -> Result<(), Box<dyn std::err
 
     loop {
         tokio::select! {
-            result = timeout(Duration::from_millis(100), packet_rx.recv()) => {
+            result = time::timeout(Duration::from_millis(100), packet_rx.recv()) => {
                 match result {
                     Ok(Some(Ok(packet))) => {
                         debug!("[MAIN] Received packet: {:?}", packet);
