@@ -22,7 +22,7 @@ struct Args {
     #[clap(required = true)]
     host: String,
 
-    /// The MineChat server port (default: 7632)
+    /// The MineChat server port
     #[clap(short, long, default_value_t = DEFAULT_PORT)]
     port: u16,
 
